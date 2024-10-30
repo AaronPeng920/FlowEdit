@@ -1,10 +1,9 @@
 #!/bin/bash
 
-cd ../inters
+cd ../inters || exit 1
 
-find "." -maxdepth 1 -type f -exec rm -f {} +
-
-find "." -mindepth 1 -type d | while read -r dir; do
-    find "$dir" -type f -exec rm -f {} +
+subdirs=$(find "." -mindepth 1 -maxdepth 1 -type d)
+for subdir in $subdirs; do
+    rm -rf "$subdir"/*
+    find "$subdir" -maxdepth 1 -name '.*' -exec rm -rf {} +
 done
-

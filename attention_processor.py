@@ -438,6 +438,7 @@ if __name__ == '__main__':
     parser.add_argument('--index', type=int, default=0, help="Token index for select mode")
     parser.add_argument('--prompt', type=str, default="", help="Source prompt")
     parser.add_argument('--num_inference_steps', type=int, default=25, help="Number of inference steps")
+    parser.add_argument('--seed', type=int, default=319, help="Generator seed.")
     parser.add_argument('--filter_ids', type=int, nargs='*', default=list(np.arange(24)), help="Registered attention layer ids.")
     args = parser.parse_args()
     
@@ -467,6 +468,8 @@ if __name__ == '__main__':
             torch_dtype=torch_dtype
         ).to(device)
     
+    logger.info(f"Loaded model from `{model_id_or_path}` successfully, inferencing with `{torch_dtype}` on `{device}`.")
+    
     kwargs = {
         "index": args.index
     }
@@ -488,10 +491,13 @@ if __name__ == '__main__':
     )
     logger.info(f"Registered `{registered_attn_processors_count}` attention processors, namely `{registered_attn_processor_names}`.")
     
-    logger.info(f"Sampling using prompt of `{args.prompt}` with `{args.num_inference_steps}` steps.")
+    generator = torch.manual_seed(args.seed)
+    logger.info(f"Using seed of `{args.seed}`.")
+    logger.info(f"The prompt is `{args.prompt}`, sampling `{args.num_inference_steps}` steps.")
     images = pipe(
         prompt=args.prompt,
-        num_inference_steps=args.num_inference_steps
+        num_inference_steps=args.num_inference_steps,
+        generator=generator
     ).images
     images[0].save("sample.png")
     logger.info("Sampling done and saved at `sample.png`.")

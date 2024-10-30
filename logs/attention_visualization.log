@@ -1,9 +1,11 @@
-2024/10/30 16:37:04 - [INFO] ============================ Visualize Attention in MM-DiT ============================
-2024/10/30 16:37:04 - [INFO] The image resolution is `512`.
-2024/10/30 16:37:04 - [INFO] Using T5 XXL text encoder.
-2024/10/30 16:37:04 - [INFO] The selected after filter attention processor ids is [23].
-2024/10/30 16:37:04 - [INFO] Attention visualization mode is `all`.
-2024/10/30 16:37:04 - [INFO] Visualizing attention maps in real time, saving at `inters/attentions/`
-2024/10/30 16:37:11 - [INFO] Registered `1` attention processors, namely `['transformer_blocks.23.attn.processor']`.
-2024/10/30 16:37:11 - [INFO] Sampling using prompt of `a photo of a cat and a dog` with `25` steps.
-2024/10/30 16:38:11 - [INFO] Sampling done and saved at `sample.png`.
+2024/10/30 17:11:42 - [INFO] ============================ Visualize Attention in MM-DiT ============================
+2024/10/30 17:11:42 - [INFO] The image resolution is `512`.
+2024/10/30 17:11:42 - [INFO] Using T5 XXL text encoder.
+2024/10/30 17:11:42 - [INFO] The selected after filter attention processor ids is `[23]`.
+2024/10/30 17:11:42 - [INFO] Attention visualization mode is `all`.
+2024/10/30 17:11:42 - [INFO] Visualizing attention maps in real time, saving at `inters/attentions/`
+2024/10/30 17:11:49 - [INFO] Loaded model from `/data/pengzhengwei/checkpoints/stablediffusion/v3` successfully, inferencing with `torch.float16` on `cuda:5`.
+2024/10/30 17:11:49 - [INFO] Registered `1` attention processors, namely `['transformer_blocks.23.attn.processor']`.
+2024/10/30 17:11:49 - [INFO] Using seed of `319`.
+2024/10/30 17:11:49 - [INFO] The prompt is `a photo of a cat and a dog`, sampling `25` steps.
+2024/10/30 17:12:48 - [INFO] Sampling done and saved at `sample.png`.
