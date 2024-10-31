@@ -416,6 +416,7 @@ if __name__ == '__main__':
     
     import logging
     import argparse
+    from utils import convert_attention_maps_to_video
     
     model_id_or_path = "/data/pengzhengwei/checkpoints/stablediffusion/v3"
     torch_dtype = torch.float16
@@ -440,8 +441,13 @@ if __name__ == '__main__':
     parser.add_argument('--num_inference_steps', type=int, default=25, help="Number of inference steps")
     parser.add_argument('--seed', type=int, default=319, help="Generator seed.")
     parser.add_argument('--filter_ids', type=int, nargs='*', default=list(np.arange(24)), help="Registered attention layer ids.")
+    parser.add_argument('--save_dynamic', action="store_true", default=False, help="Saving dynamic attention changes")
+    parser.add_argument('--fps', type=int, default=5, help="Frames per second of dynamic attention changes video")
     args = parser.parse_args()
     
+    if len(args.filter_ids) == 1 and args.filter_ids[0] == -1:
+        args.filter_ids = list(np.arange(24))
+        
     logger.info("============================ Visualize Attention in MM-DiT ============================")
     logger.info(f"The image resolution is `{args.image_resolution}`.")
     if args.use_t5:
@@ -497,10 +503,20 @@ if __name__ == '__main__':
     images = pipe(
         prompt=args.prompt,
         num_inference_steps=args.num_inference_steps,
-        generator=generator
+        generator=generator,
+        height=args.image_resolution,
+        width=args.image_resolution
     ).images
     images[0].save("sample.png")
     logger.info("Sampling done and saved at `sample.png`.")
+    
+    if args.save_dynamic:
+        output_video_names, output_video_count = convert_attention_maps_to_video(
+            "inters/attentions",
+            read_flag="gray",
+            fps=args.fps
+        )
+        logger.info(f"Has made `{output_video_count}` attention dynamic change videos with `{args.fps}` fps, namely `{output_video_names}`.")
         
     
     
