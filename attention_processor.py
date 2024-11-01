@@ -7,6 +7,7 @@ import math
 import numpy as np
 from PIL import Image
 from diffusers import StableDiffusion3Pipeline
+from utils import generate_mask
 
 # Copied and revised from torch.nn.functional.scaled_dot_product_attention()
 def scaled_dot_product_attention(
@@ -68,6 +69,7 @@ class JointAttnStore:
         has_text_encoder_3: Optional[bool] = False,
         mode: Optional[str] = "all",
         visualize_now: Optional[bool] = False,
+        mask_type: Optional[str] = "",
         **kwargs
     ):
         if not hasattr(F, "scaled_dot_product_attention"):
@@ -79,6 +81,7 @@ class JointAttnStore:
         self.has_text_encoder_3 = has_text_encoder_3
         self.mode = mode
         self.visualize_now = visualize_now
+        self.mask_type = mask_type
         self.extra_args = kwargs
         
     def reset(self):
@@ -129,7 +132,14 @@ class JointAttnStore:
         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)        
         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)    
         
-        attn_weight, value = scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)        # [B, h, HW, C // h], [B, h, HW, HW]
+        attn_mask = generate_mask(
+                query.dtype, query.device,
+                self.mask_type,
+                self.image_resolution, 
+                self.has_text_encoder_3
+            )    # [B, h, L, L]
+        
+        attn_weight, value = scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)        # [B, h, HW, C // h], [B, h, HW, HW]
         hidden_states = attn_weight @ value
             
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
@@ -223,6 +233,9 @@ def register_attention_processor(
             key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)        
             value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)    
             
+            if self.enable:
+                query, key, value = controller.process_qkv(query, key, value)
+            
             attn_weight, value = scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)        # [B, h, L, L], [B, h, L, C // h]
             
             if self.enable:
@@ -280,6 +293,7 @@ def register_attention_store(
     has_text_encoder_3: Optional[bool] = True,
     mode: Optional[str] = None,
     visualize_now: Optional[bool] = True,
+    mask_type: Optional[str] = "",
     **kwargs
 ):
     if filter is None:
@@ -298,6 +312,7 @@ def register_attention_store(
                 has_text_encoder_3=has_text_encoder_3,
                 mode=mode,
                 visualize_now=visualize_now,
+                mask_type=mask_type,
                 **kwargs
             )
             registered_attn_processors_count += 1
@@ -400,8 +415,7 @@ def visualize_attention(
         else:
             raise ValueError(f"Unsupport visualization mode of `{mode}`.")
         
-        
-        
+    
 if __name__ == '__main__':
     """DEMO
         python attention_processor.py \
@@ -411,7 +425,9 @@ if __name__ == '__main__':
             --visualize_now \
             --prompt 'a photo of a cat and a dog' \
             --num_inference_steps 25 \
-            --index   5
+            --index  5 \
+            --save_dynamic \
+            --fps 10
     """
     
     import logging
@@ -443,6 +459,7 @@ if __name__ == '__main__':
     parser.add_argument('--filter_ids', type=int, nargs='*', default=list(np.arange(24)), help="Registered attention layer ids.")
     parser.add_argument('--save_dynamic', action="store_true", default=False, help="Saving dynamic attention changes")
     parser.add_argument('--fps', type=int, default=5, help="Frames per second of dynamic attention changes video")
+    parser.add_argument('--mask_type', type=str, default="", help="Attention mask type")
     args = parser.parse_args()
     
     if len(args.filter_ids) == 1 and args.filter_ids[0] == -1:
@@ -493,9 +510,11 @@ if __name__ == '__main__':
         has_text_encoder_3=args.use_t5,
         mode=args.mode,
         visualize_now=args.visualize_now,
+        mask_type=args.mask_type,
         **kwargs
     )
     logger.info(f"Registered `{registered_attn_processors_count}` attention processors, namely `{registered_attn_processor_names}`.")
+    logger.info(f"Attention mask type is set to `{args.mask_type}`.")
     
     generator = torch.manual_seed(args.seed)
     logger.info(f"Using seed of `{args.seed}`.")

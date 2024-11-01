@@ -3,7 +3,6 @@
 cd ..
 python attention_processor.py \
     --image_resolution 512 \
-    --use_t5 \
     --mode 'select' \
     --visualize_now \
     --prompt 'a photo of a cat and a dog' \
@@ -11,5 +10,4 @@ python attention_processor.py \
     --seed 319 \
     --index 5 \
     --filter_ids -1 \
-    --save_dynamic \
-    --fps 5
+    --mask_type 't52t5'

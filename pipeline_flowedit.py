@@ -14,7 +14,7 @@ from transformers import (
     T5TokenizerFast,
 )
 
-from diffusers.image_processor import VaeImageProcessor
+from diffusers.image_processor import VaeImageProcessor, PipelineImageInput
 from diffusers.loaders import FromSingleFileMixin, SD3LoraLoaderMixin
 from diffusers.models.autoencoders import AutoencoderKL
 from diffusers.models.transformers import SD3Transformer2DModel
@@ -109,7 +109,63 @@ def retrieve_timesteps(
         timesteps = scheduler.timesteps
     return timesteps, num_inference_steps
 
+def flow_consistency_sampler(
+    z_src: torch.FloatTensor,
+    z_tgt: torch.FloatTensor,
+    z_noise: torch.FloatTensor,
+    z_gt: torch.FloatTensor,
+    v_pred_src: torch.FloatTensor,
+    v_pred_tgt: torch.FloatTensor,
+    timestep: Union[float, torch.FloatTensor],
+    scheduler: FlowMatchEulerDiscreteScheduler
+):
+    if (
+            isinstance(timestep, int)
+            or isinstance(timestep, torch.IntTensor)
+            or isinstance(timestep, torch.LongTensor)
+        ):
+            raise ValueError(
+                (
+                    "Passing integer indices (e.g. from `enumerate(timesteps)`) as timesteps to"
+                    " `EulerDiscreteScheduler.step()` is not supported. Make sure to pass"
+                    " one of the `scheduler.timesteps` as a timestep."
+                ),
+            )
 
+    if scheduler.step_index is None:
+        scheduler._init_step_index(timestep)
+
+    # Upcast to avoid precision issues when computing prev_sample
+    v_pred_src_dtype = v_pred_src.dtype
+    v_pred_tgt_dtype = v_pred_tgt.dtype
+    
+    z_src = z_src.to(torch.float32)
+    z_tgt = z_tgt.to(torch.float32)
+    z_gt = z_gt.to(torch.float32)
+    
+    sigma = scheduler.sigmas[scheduler.step_index]                  # sigma_t
+    sigma_next = scheduler.sigmas[scheduler.step_index + 1]         # sigma_{t-1}
+
+
+    v_gt = z_noise - z_gt    
+    # For source branch
+    v_src_res = v_gt - v_pred_src
+    z_src_prev = z_src + (sigma_next - sigma) * (v_pred_src + v_src_res)
+    
+    # For target branch
+    v_pred_tgt = v_pred_tgt + v_src_res
+    z_tgt_prev = z_tgt + (sigma_next - sigma) * v_pred_tgt
+    
+    # Cast sample back to model compatible dtype
+    z_src_prev = z_src_prev.to(v_pred_src_dtype)
+    z_tgt_prev = z_tgt_prev.to(v_pred_tgt_dtype)
+    
+    # upon completion increase step index by one
+    scheduler._step_index += 1
+    
+    
+    return z_tgt_prev, z_src_prev
+    
 class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixin):
     r"""
     Args:
@@ -146,7 +202,7 @@ class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixi
     
     model_cpu_offload_seq = "text_encoder->text_encoder_2->text_encoder_3->transformer->vae"
     _optional_components = []
-    _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds", "negative_pooled_prompt_embeds"]
+    _callback_tensor_inputs = ["latents", "source_latents", "prompt_embeds", "negative_prompt_embeds", "negative_pooled_prompt_embeds"]
     
     # Copied from diffusers.pipelines.stable_diffusion_3.StableDiffusion3Pipeline.__init__()
     def __init__(
@@ -494,7 +550,7 @@ class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixi
 
         return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
     
-    # Copied from diffusers.pipelines.stable_diffusion_3.StableDiffusion3Pipeline.check_inputs()
+    # Copied and revised from diffusers.pipelines.stable_diffusion_3.StableDiffusion3Pipeline.check_inputs()
     def check_inputs(
         self,
         prompt,
@@ -585,37 +641,68 @@ class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixi
         if max_sequence_length is not None and max_sequence_length > 512:
             raise ValueError(f"`max_sequence_length` cannot be greater than 512 but is {max_sequence_length}")
     
-    # Copied from diffusers.pipelines.stable_diffusion_3.StableDiffusion3Pipeline.check_inputs()
+    # Copied and revised from diffusers.pipelines.stable_diffusion_3.StableDiffusion3Pipeline.check_inputs()
     def prepare_latents(
         self,
+        image,
+        sigma,
         batch_size,
+        num_images_per_prompt,
         num_channels_latents,
         height,
         width,
         dtype,
         device,
         generator,
+        denoise_model=True,
         latents=None,
     ):
         if latents is not None:
             return latents.to(device=device, dtype=dtype)
 
+        image = image.to(device=device, dtype=dtype)
+        assert image.shape[0] == batch_size
+        
+        bs = batch_size * num_images_per_prompt
+        if num_images_per_prompt > 1:
+            image = image.unsqueeze(1).repeat(1, num_images_per_prompt, 1, 1, 1)
+            image = image.view(-1, *image.shape[-3:])
+        
+        if denoise_model:
+            height = image.shape[-2] // self.vae_scale_factor
+            width = image.shape[-1] // self.vae_scale_factor
+        else:
+            height = int(height) // self.vae_scale_factor
+            width = int(width) // self.vae_scale_factor
+            
         shape = (
-            batch_size,
+            bs,
             num_channels_latents,
-            int(height) // self.vae_scale_factor,
-            int(width) // self.vae_scale_factor,
+            height,
+            width
         )
 
-        if isinstance(generator, list) and len(generator) != batch_size:
+        if isinstance(generator, list) and len(generator) != bs:
             raise ValueError(
                 f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
-                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+                f" size of {bs}. Make sure the batch size matches the length of the generators."
             )
 
+        if isinstance(generator, list):
+            init_latents = [
+                self.vae.encode(image[i : i + 1]).latent_dist.sample(generator[i]) for i in range(bs)
+            ]
+            init_latents = torch.cat(init_latents, dim=0)
+        else:
+            init_latents = self.vae.encode(image).latent_dist.sample(generator)
+        init_latents = self.vae.config.scaling_factor * init_latents
+        clean_latents = init_latents
+        
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        if denoise_model:
+            latents = clean_latents + sigma * (latents - clean_latents)
 
-        return latents
+        return latents, clean_latents
     
     @property
     def guidance_scale(self):
@@ -661,6 +748,7 @@ class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixi
         source_prompt: Union[str, List[str]] = None,
         source_prompt_2: Optional[Union[str, List[str]]] = None,
         source_prompt_3: Optional[Union[str, List[str]]] = None,
+        image: PipelineImageInput = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 28,
@@ -684,13 +772,14 @@ class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixi
         source_negative_prompt_embeds: Optional[torch.FloatTensor] = None,
         source_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
         source_negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+        denoise_model: Optional[bool] = True,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
         return_source: bool = False,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         clip_skip: Optional[int] = None,
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
-        callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        callback_on_step_end_tensor_inputs: List[str] = ["latents", "source_latents"],
         max_sequence_length: int = 256,
     ):
         r"""
@@ -894,27 +983,38 @@ class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixi
         if self.do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, source_negative_prompt_embeds, prompt_embeds, source_prompt_embeds], dim=0)                               
             pooled_prompt_embeds = torch.cat([negative_pooled_prompt_embeds, source_negative_pooled_prompt_embeds, pooled_prompt_embeds, source_pooled_prompt_embeds], dim=0)
+            # pooled_prompt_embeds = torch.cat([negative_pooled_prompt_embeds, negative_pooled_prompt_embeds, pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
         else:
             prompt_embeds = torch.cat([prompt_embeds, source_prompt_embeds], dim=0)
-            
+        
+        image = self.image_processor.preprocess(image)
+        
         # 4. Prepare timesteps
         timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
+        if self.scheduler.step_index is None:
+            self.scheduler._init_step_index(timesteps[0])
+        sigma_first = self.scheduler.sigmas[self.scheduler.step_index]
 
         # 5. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels
-        latents = self.prepare_latents(
-            batch_size * num_images_per_prompt,
+        latents, clean_latents = self.prepare_latents(
+            image,
+            sigma_first,
+            batch_size,
+            num_images_per_prompt,
             num_channels_latents,
             height,
             width,
             prompt_embeds.dtype,
             device,
             generator,
+            denoise_model,
             latents,
         )           # [B, 16, H / 8 (128), W / 8 (128)] 
         source_latents = latents
+        origin_latents = latents
         
         # 6. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -964,9 +1064,25 @@ class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixi
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_input = torch.cat([latents, source_latents], dim=0)
                 latents_dtype = latents.dtype
-                latents_output = self.scheduler.step(noise_pred, t, latents_input, return_dict=False)[0]
-                latents, source_latents = latents_output.chunk(2, dim=0)
- 
+                
+                # # For Normal Sampling
+                # latents_output = self.scheduler.step(noise_pred, t, latents_input, return_dict=False)[0]
+                # latents, source_latents = latents_output.chunk(2, dim=0)
+                
+                # # For Flow Consistency Sampling
+                target_noise_pred, source_noise_pred = noise_pred.chunk(2, dim=0)
+                latents, source_latents = flow_consistency_sampler(
+                    z_src = source_latents,
+                    z_tgt = latents,
+                    z_noise = origin_latents,
+                    z_gt = clean_latents,
+                    v_pred_src = source_noise_pred,
+                    v_pred_tgt = target_noise_pred,
+                    timestep = t,
+                    scheduler = self.scheduler
+                )
+                
+                
                 if latents.dtype != latents_dtype:
                     if torch.backends.mps.is_available():
                         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
@@ -1023,6 +1139,8 @@ class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixi
     
     
 if __name__ == '__main__':
+    from utils import save_inter_latents_callback
+    
     IMAGE_RESOLUTION = 512
     USE_T5 = False
     FLOAT16 = True
@@ -1053,13 +1171,17 @@ if __name__ == '__main__':
             torch_dtype=torch_dtype
         ).to(device)
     
+    source_image = PIL.Image.open("assets/girl_dog.png").convert('RGB').resize([IMAGE_RESOLUTION, IMAGE_RESOLUTION])
     images, source_images = pipe(
-        prompt="A photo of a cat",
-        source_prompt="A photo of a dog",
+        prompt="A girl is feeding a dog",
+        image=source_image,
+        source_prompt="A girl is feeding a cat",
         num_inference_steps=25,
         height=IMAGE_RESOLUTION,
         width=IMAGE_RESOLUTION,
-        return_source=True
+        denoise_model=True,
+        return_source=True,
+        callback_on_step_end=save_inter_latents_callback
     )
     
     images.images[0].save("target.png")

@@ -190,7 +190,7 @@ def get_mapper(x: str, y: str, specifier, tokenizer, encoder, device, max_len=77
     i = 1
     j = 1
     while (i < len(y_seq)-1) and (j < len(m_seq)-1):
-        while m_seq[j] != y_seq[i]:
+        while i < len(y_seq)-1 and m_seq[j] != y_seq[i]:
             i = i + 1
         if m_seq[j] == x_seq[mapper[i]]:
             alpha_m[i] = 1
