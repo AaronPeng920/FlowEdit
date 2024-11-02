@@ -1,3 +1,6 @@
+import os
+import argparse
+import json
 import torch
 from pipeline_flowedit import FlowEditPipeline
 from attention_processor import register_attention_processor, visualize_attention
@@ -8,6 +11,8 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from sklearn.decomposition import PCA
 from PIL import Image
 import numpy as np
+import time
+from utils import combine_images_with_captions
 
 # Copied and revised from https://github.com/sled-group/InfEdit/blob/main/app_infedit/AttentionControl
 class AttentionControl(abc.ABC):
@@ -30,7 +35,6 @@ class AttentionControl(abc.ABC):
             attn_weight, value = self.forward(attn_weight, value)
         self.cur_att_layer += 1
         if self.cur_att_layer == self.num_att_layers:
-            logger.info(f"Complete the {self.cur_step + 1}/{self.num_inference_steps} step.")
             self.cur_att_layer = 0
             self.cur_step += 1
             self.between_steps()
@@ -65,7 +69,7 @@ class AttentionStore(AttentionControl):
         return []
 
     def forward(self, attn_weight: torch.Tensor, value: torch.Tensor):
-        if self.mode is not None and self.mode != "":
+        if self.mode is not None:
             stored_attn_weight = self.__get_attention_apart(attn_weight)
             if self.visualize_now:
                 self.__visualize_attention_now(stored_attn_weight)
@@ -276,7 +280,6 @@ class AttentionRefine(AttentionControlEdit):
         attn_replace[:, :, latent_l:latent_l+mapper_l, :latent_l] = mapped_source_text2latent * alphas + (1. - alphas) * target_text2latent
         cur_progress = (self.cur_step + 1) * 1.0 / self.num_inference_steps
         if cur_progress >= self.cross_start_step and cur_progress <= self.cross_end_step:
-            logger.info(f"Replace cross attention map at {self.cur_att_layer}th layer.")
             attn_target[:b] = attn_replace
         
         return attn_target
@@ -306,8 +309,6 @@ class AttentionRefine(AttentionControlEdit):
                 
                 key = torch.cat([source_key_uncond, source_key_uncond, source_key_uncond, source_key_uncond], dim=0)
                 value = torch.cat([source_value_uncond, source_value_uncond, source_value_cond, source_value_cond], dim=0)
-            
-                logger.info(f"Modulate Q, K, V at {self.cur_att_layer}th layer.")
             
         
         # pca = PCA(n_components=1)
@@ -408,28 +409,8 @@ class AttentionRefine(AttentionControlEdit):
         self.alphas = alphas.reshape(alphas.shape[0], 1, 1, alphas.shape[1]).to(device).to(torch_dtype)     # [n, 1, 1, S]
         self.ms = ms.reshape(ms.shape[0], 1, 1, ms.shape[1]).to(device).to(torch_dtype)
 
-        logger.info(f"=========== Initializing AttentionRefine controller. ===========")
-        logger.info(f"source prompt is `{prompts[0]}`.")
-        logger.info(f"target prompt is `{prompts[1]}`.")
-        logger.info(f"source blend is `{prompt_specifiers[0][1]}`.")
-        logger.info(f"target blend is `{prompt_specifiers[0][0]}`.")
-        logger.info(f"source encoded sequence is `{x_seq_string}`.")
-        logger.info(f"target encoded sequence is `{y_seq_string}`.")
-        logger.info(f"original mapper is {original_mapper}.")
-        logger.info(f"final mapper is `{mapper}`.")
-        logger.info(f"final alphas is `{alphas}`.")
-        logger.info(f"total inference steps is `{num_inference_steps}`.")
-        logger.info(f"cross attention replacement start step is {cross_start_step}.")
-        logger.info(f"cross attention replacement end step is {cross_end_step}.")
-        logger.info(f"self attention replacement start step is {self_start_step}.")
-        logger.info(f"self attention replacement end step is {self_end_step}.")
-        logger.info(f"visualize attention mode is `{mode}`.")
-        logger.info(f"set visualize attention now to `{visualize_attention_now}`.")
-        logger.info(f"extra args are `{kwargs}`.")
-        logger.info(f"================================================================")
-
-
 def inference(
+    pipe: FlowEditPipeline,
     image: Image,
     source_prompt: str,
     target_prompt: str,
@@ -452,9 +433,6 @@ def inference(
     **kwargs
 ):
     generator = torch.manual_seed(seed) if seed is not None else None
-    logger.info(f"Set random seed `{seed}`.")
-    if callback_on_step_end is not None:
-        logger.info(f"Set step end callback `{callback_on_step_end.__name__}`")
         
     controller = AttentionRefine(
         prompts=[source_prompt, target_prompt],
@@ -477,7 +455,6 @@ def inference(
     )
 
     registered_attn_processor_names, registered_attn_processors_count = register_attention_processor(pipe.transformer, controller, attention_processor_filter)
-    logger.info(f"Registered {registered_attn_processors_count} {controller.__class__.__name__} controllers, namely {registered_attn_processor_names}.")
 
     result, source = pipe(
         prompt=target_prompt,
@@ -500,19 +477,35 @@ def inference(
     return result_images[0], source_images[0], controller
 
 if __name__ == '__main__':
-    from utils import save_inter_latents_callback
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--source_root', type=str, required=True)
+    parser.add_argument('--result_root', type=str, required=True)
+    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--image_resolution', type=int, default=512)
+    parser.add_argument('--num_inference_steps', type=int, default=12)
+    parser.add_argument('--source_guidance_scale', type=float, default=2.0)
+    parser.add_argument('--target_guidance_scale', type=float, default=7.0)
+    parser.add_argument('--cross_start_step', type=float, default=0.0)
+    parser.add_argument('--cross_end_step', type=float, default=0.3)
+    parser.add_argument('--self_start_step', type=float, default=0.3)
+    parser.add_argument('--self_end_step', type=float, default=0.7)
+    parser.add_argument('--seed', type=int, default=319)
+    args = parser.parse_args()
+    
+    # 1. Preparing logger
     logging.basicConfig(
         level=logging.DEBUG, 
         datefmt='%Y/%m/%d %H:%M:%S', 
         format='%(asctime)s - [%(levelname)s] %(message)s', 
-        filename="logs/flow_edit_process.log", 
+        filename="logs/pie_benchmark_test.log", 
         filemode='w'
     )
     logger = logging.getLogger("FlowEdit")
 
+    # 2. Loading FlowEditPipeline
     MODEL_ID_OR_PATH = "/data/pengzhengwei/checkpoints/stablediffusion/v3"
     TORCH_DTYPE = torch.float16
-    DEVICE = "cuda:5"
+    DEVICE = args.device
 
     pipe = FlowEditPipeline.from_pretrained(
             MODEL_ID_OR_PATH,
@@ -521,58 +514,97 @@ if __name__ == '__main__':
             torch_dtype=TORCH_DTYPE
         ).to(DEVICE)
     logger.info(f"Load FlowEditPipeline from `{MODEL_ID_OR_PATH}` successfully, inferencing with `{TORCH_DTYPE}` on `{DEVICE}`.")
-
-    source_prompt = "a little carton sheep in a white background"
-    target_prompt = "a little carton sheep in a forest background"
-    source_blended_words = ""
-    target_blended_words = ""
-    source_guidance_scale = 1.5
-    target_guidance_scale = 2.0
-    num_inference_steps = 10
-    cross_start_step = 0.0
-    cross_end_step = 0.2
-    self_start_step = 0.2
-    self_end_step = 0.3
-    image_resolution = 512
-    seed = 1234
-    image = Image.open("/data/pengzhengwei/datasets/PIE-Bench/PIE-Bench_v1/annotation_images/8_change_background_80/1_artificial/1_animal/811000000000.jpg").convert('RGB').resize([image_resolution, image_resolution])
-    attention_visualize_mode = None
-    visualize_attention_now = True
-    denoise_model = False
-    callback_on_step_end = save_inter_latents_callback
-    kwargs = {
-        'index': 2
-    }
-
-    def filter(i, name):
-        if i <= 8:
-            return True
-        else:
-            return False
+    
+    # 3. Preparing dataset
+    source_images_dir = os.path.join(args.source_root, "annotation_images")
+    annotation_file = os.path.join(args.source_root, "mapping_file.json")
+    with open (annotation_file) as f:
+        annotations = json.load(f)
+    annotation_count = len(annotation_file)
+    result_images_dir = os.path.join(args.result_root, "annotation_images")
+    if not os.path.exists(result_images_dir):
+        os.makedirs(result_images_dir, exist_ok=True)
+    
+    # 4. Preparing all params
+    logger.info("===================== PIE BenchMark Test =====================")
+    IMAGE_RESOLUTION = args.image_resolution
+    NUM_INFERENCE_STEPS = args.num_inference_steps
+    SOURCE_GUIDANCE_SCALE = args.source_guidance_scale
+    TARGET_GUIDANCE_SCALE = args.target_guidance_scale
+    CROSS_START_STEP = args.cross_start_step
+    CROSS_END_STEP = args.cross_end_step
+    SELF_START_STEP = args.self_start_step
+    SELF_END_STEP = args.self_end_step
+    SEED = args.seed
+    
+    logger.info(f"Using Image Resolution `{IMAGE_RESOLUTION}`, source guidance scale is `{SOURCE_GUIDANCE_SCALE}`, target guidance scale is `{TARGET_GUIDANCE_SCALE}`.")
+    logger.info(f"Cross attention replace start step is `{CROSS_START_STEP}`, end step is `{CROSS_END_STEP}`.")
+    logger.info(f"Self attention modulating start step is `{SELF_START_STEP}`, end step is `{SELF_END_STEP}`.")
+    logger.info(f"Using generator seed `{SEED}`.")
+    logger.info("==============================================================")
+    
+    for i, (item_idx, annotation)  in enumerate(annotations.items()):
+        image_path = os.path.join(source_images_dir, annotation["image_path"])
+        image = Image.open(image_path).convert("RGB").resize([IMAGE_RESOLUTION, IMAGE_RESOLUTION])
         
-    result_image, source_image, controller = inference(
-        image=image,
-        source_prompt=source_prompt,
-        target_prompt=target_prompt,
-        source_blended_words=source_blended_words,
-        target_blended_words=target_blended_words,
-        source_guidance_scale=source_guidance_scale,
-        target_guidance_scale=target_guidance_scale,
-        num_inference_steps=num_inference_steps,
-        cross_start_step=cross_start_step,
-        cross_end_step=cross_end_step,
-        self_start_step=self_start_step,
-        self_end_step=self_end_step,
-        image_resolution=image_resolution,
-        seed=seed,
-        attention_visualize_mode=attention_visualize_mode,
-        visualize_attention_now=visualize_attention_now,
-        denoise_model=denoise_model,
-        attention_processor_filter=filter,
-        callback_on_step_end=callback_on_step_end,
-        **kwargs
-    )
+        source_prompt = annotation["original_prompt"]
+        target_prompt = annotation["editing_prompt"]
+        
+        editing_type = int(annotation["editing_type_id"])
+        
+        blended_word = annotation["blended_word"]
+        source_blend_word = ""
+        target_blend_word = ""
+        
+        logger.info(f"[{i+1}/{annotation_count}] {item_idx} : `{source_prompt}` -> `{target_prompt}`")
+        logger.info(f"[{i+1}/{annotation_count}] source blend word is `{source_blend_word}`, target blend word is `{target_blend_word}`.")
+        kwargs = {}
+        start_time = time.time()
+        result, source, _ = inference(
+            pipe=pipe,
+            image=image,
+            source_prompt=source_prompt,
+            target_prompt=target_prompt,
+            source_blended_words="",
+            target_blended_words="",
+            source_guidance_scale=SOURCE_GUIDANCE_SCALE,
+            target_guidance_scale=TARGET_GUIDANCE_SCALE,
+            num_inference_steps=NUM_INFERENCE_STEPS,
+            cross_start_step=CROSS_START_STEP,
+            cross_end_step=CROSS_END_STEP,
+            self_start_step=SELF_START_STEP,
+            self_end_step=SELF_END_STEP,
+            image_resolution=IMAGE_RESOLUTION,
+            seed=SEED,
+            attention_processor_filter=None,
+            attention_visualize_mode=None, 
+            visualize_attention_now=True, 
+            denoise_model=False,
+            callback_on_step_end=None,
+            **kwargs
+        )
+        end_time = time.time()
+        logger.info(f"[{i+1}/{annotation_count}] using time `{format(end_time - start_time, '.3f')}s`.")
+        
+        compare_image = combine_images_with_captions(source, source_prompt, result, target_prompt, font_size=40)
+        output_filename = os.path.join(args.result_root, annotation["image_path"])
+        output_dir = os.path.dirname(output_filename)
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+        compare_image.save(output_filename)
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+    
+    
 
-    result_image.save("result.png")
-    source_image.save("source.png")
+
 

@@ -7,6 +7,7 @@ import pandas as pd
 from tqdm import tqdm
 import torch
 from pipeline_flowedit import FlowEditPipeline
+import PIL
 
 def convert_attention_maps_to_video(
     attention_maps_image_folder: str,
@@ -288,7 +289,37 @@ def generate_mask(
             raise ValueError(f"Unsupprted mask type of `{mask_type}`.")
     return masks
     
+def combine_images_with_captions(
+    image1: PIL.Image,
+    caption1: str,
+    image2: PIL.Image, 
+    caption2: str, 
+    image_size: Optional[List[int]] = None,
+    font_size: Optional[int] = 40
+):
+    if image_size is None:
+        image_size = image1.size
+        image2.resize(image_size)
     
+    width, height = image_size
+    total_width = width * 2
+    total_height = height + font_size
+
+    new_image = PIL.Image.new('RGB', (total_width, total_height), (255, 255, 255))
+    new_image.paste(image1, (0, font_size))  
+    new_image.paste(image2, (width, font_size))  
+
+    draw = PIL.ImageDraw.Draw(new_image)
+    font = PIL.ImageFont.load_default()  
+    caption1_width = draw.textlength(caption1, font)
+    caption2_width = draw.textlength(caption2, font)
+    x1 = (width - caption1_width) // 2
+    x2 = width + (width - caption2_width) // 2 
+    draw.text((x1, 10), caption1, font=font, fill=(0, 0, 255))  # 图像1的标题
+    draw.text((x2, 10), caption2, font=font, fill=(255, 100, 0))  # 图像2的标题
+
+    return new_image
+            
 if __name__ == '__main__':
     saved_video_names, count = convert_attention_maps_to_video(
         "/home/pengzhengwei/projects/FlowEdit/inters/attentions",

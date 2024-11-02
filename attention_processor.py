@@ -356,8 +356,9 @@ def visualize_attention(
         """ 
         if mode == "select":
             select_index = kwargs.pop("index")
-            attn_map = attn_map[:, select_index]
-            H = W = int(attn_map.shape[0] ** 0.5)
+            attn_map = attn_map[:, select_index]        # for latent2clip
+            # attn_map = attn_map[select_index, :]        # for clip2latent
+            H = W = int(attn_map.shape[0] ** 0.5)       
             attn_map = attn_map.view(H, W)
         attn_map = attn_map.cpu().numpy()
         attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min())      # normalization
@@ -410,8 +411,9 @@ def visualize_attention(
             save_attn_map_gray(step_i, t52clip, mode, save_prefix)
         elif mode == 't52t5':
             save_attn_map_gray(step_i, t52t5, mode, save_prefix)
-        elif mode == 'select':                                      # for latent2clip
-            save_attn_map_gray(step_i, latent2clip, mode, save_prefix, **kwargs)
+        elif mode == 'select':                                      
+            save_attn_map_gray(step_i, latent2clip, mode, save_prefix, **kwargs)    # for latent2clip
+            # save_attn_map_gray(step_i, clip2latent, mode, save_prefix, **kwargs)    # for clip2latent
         else:
             raise ValueError(f"Unsupport visualization mode of `{mode}`.")
         

@@ -1,13 +1,13 @@
-2024/11/01 21:44:08 - [INFO] ============================ Visualize Attention in MM-DiT ============================
-2024/11/01 21:44:08 - [INFO] The image resolution is `512`.
-2024/11/01 21:44:08 - [INFO] Not using T5 XXL text encoder.
-2024/11/01 21:44:08 - [INFO] The selected after filter attention processor ids is `[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]`.
-2024/11/01 21:44:08 - [INFO] Attention visualization mode is `select`.
-2024/11/01 21:44:08 - [INFO] Visualizing attention maps in real time, saving at `inters/attentions/`
-2024/11/01 21:44:08 - [INFO] The selected token index is `5`
-2024/11/01 21:44:12 - [INFO] Loaded model from `/data/pengzhengwei/checkpoints/stablediffusion/v3` successfully, inferencing with `torch.float16` on `cuda:5`.
-2024/11/01 21:44:12 - [INFO] Registered `24` attention processors, namely `['transformer_blocks.0.attn.processor', 'transformer_blocks.1.attn.processor', 'transformer_blocks.2.attn.processor', 'transformer_blocks.3.attn.processor', 'transformer_blocks.4.attn.processor', 'transformer_blocks.5.attn.processor', 'transformer_blocks.6.attn.processor', 'transformer_blocks.7.attn.processor', 'transformer_blocks.8.attn.processor', 'transformer_blocks.9.attn.processor', 'transformer_blocks.10.attn.processor', 'transformer_blocks.11.attn.processor', 'transformer_blocks.12.attn.processor', 'transformer_blocks.13.attn.processor', 'transformer_blocks.14.attn.processor', 'transformer_blocks.15.attn.processor', 'transformer_blocks.16.attn.processor', 'transformer_blocks.17.attn.processor', 'transformer_blocks.18.attn.processor', 'transformer_blocks.19.attn.processor', 'transformer_blocks.20.attn.processor', 'transformer_blocks.21.attn.processor', 'transformer_blocks.22.attn.processor', 'transformer_blocks.23.attn.processor']`.
-2024/11/01 21:44:12 - [INFO] Attention mask type is set to `t52t5`.
-2024/11/01 21:44:12 - [INFO] Using seed of `319`.
-2024/11/01 21:44:12 - [INFO] The prompt is `a photo of a cat and a dog`, sampling `25` steps.
-2024/11/01 21:44:16 - [INFO] Sampling done and saved at `sample.png`.
+2024/11/02 23:45:02 - [INFO] ============================ Visualize Attention in MM-DiT ============================
+2024/11/02 23:45:02 - [INFO] The image resolution is `512`.
+2024/11/02 23:45:02 - [INFO] Not using T5 XXL text encoder.
+2024/11/02 23:45:02 - [INFO] The selected after filter attention processor ids is `[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]`.
+2024/11/02 23:45:02 - [INFO] Attention visualization mode is `select`.
+2024/11/02 23:45:02 - [INFO] Visualizing attention maps in real time, saving at `inters/attentions/`
+2024/11/02 23:45:02 - [INFO] The selected token index is `3`
+2024/11/02 23:45:05 - [INFO] Loaded model from `/data/pengzhengwei/checkpoints/stablediffusion/v3` successfully, inferencing with `torch.float16` on `cuda:5`.
+2024/11/02 23:45:05 - [INFO] Registered `24` attention processors, namely `['transformer_blocks.0.attn.processor', 'transformer_blocks.1.attn.processor', 'transformer_blocks.2.attn.processor', 'transformer_blocks.3.attn.processor', 'transformer_blocks.4.attn.processor', 'transformer_blocks.5.attn.processor', 'transformer_blocks.6.attn.processor', 'transformer_blocks.7.attn.processor', 'transformer_blocks.8.attn.processor', 'transformer_blocks.9.attn.processor', 'transformer_blocks.10.attn.processor', 'transformer_blocks.11.attn.processor', 'transformer_blocks.12.attn.processor', 'transformer_blocks.13.attn.processor', 'transformer_blocks.14.attn.processor', 'transformer_blocks.15.attn.processor', 'transformer_blocks.16.attn.processor', 'transformer_blocks.17.attn.processor', 'transformer_blocks.18.attn.processor', 'transformer_blocks.19.attn.processor', 'transformer_blocks.20.attn.processor', 'transformer_blocks.21.attn.processor', 'transformer_blocks.22.attn.processor', 'transformer_blocks.23.attn.processor']`.
+2024/11/02 23:45:05 - [INFO] Attention mask type is set to ``.
+2024/11/02 23:45:05 - [INFO] Using seed of `319`.
+2024/11/02 23:45:05 - [INFO] The prompt is `a round cake with orange frosting on a wooden plate`, sampling `10` steps.
+2024/11/02 23:45:07 - [INFO] Sampling done and saved at `sample.png`.

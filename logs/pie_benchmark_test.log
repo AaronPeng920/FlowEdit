@@ -1,0 +1,63 @@
+2024/11/02 19:32:43 - [INFO] Load FlowEditPipeline from `/data/pengzhengwei/checkpoints/stablediffusion/v3` successfully, inferencing with `torch.float16` on `cuda:5`.
+2024/11/02 19:32:43 - [INFO] ===================== PIE BenchMark Test =====================
+2024/11/02 19:32:43 - [INFO] Using Image Resolution `512`, source guidance scale is `2.0`, target guidance scale is `7.0`.
+2024/11/02 19:32:43 - [INFO] Cross attention replace start step is `0.0`, end step is `0.3`.
+2024/11/02 19:32:43 - [INFO] Self attention modulating start step is `0.3`, end step is `0.7`.
+2024/11/02 19:32:43 - [INFO] Using generator seed `319`.
+2024/11/02 19:32:43 - [INFO] ==============================================================
+2024/11/02 19:32:43 - [INFO] [1/68] 000000000000 : `a slanted mountain bicycle on the road in front of a building` -> `a slanted [rusty] mountain bicycle on the road in front of a building`
+2024/11/02 19:32:43 - [INFO] [1/68] source blend word is ``, target blend word is ``.
+2024/11/02 19:32:47 - [INFO] [1/68] using time `4.300s`.
+2024/11/02 19:32:47 - [INFO] [2/68] 000000000001 : `a [round] cake with orange frosting on a wooden plate` -> `a [square] cake with orange frosting on a wooden plate`
+2024/11/02 19:32:47 - [INFO] [2/68] source blend word is ``, target blend word is ``.
+2024/11/02 19:32:51 - [INFO] [2/68] using time `3.533s`.
+2024/11/02 19:32:51 - [INFO] [3/68] 000000000002 : `a [cat] sitting on a wooden chair` -> `a [dog] sitting on a wooden chair`
+2024/11/02 19:32:51 - [INFO] [3/68] source blend word is ``, target blend word is ``.
+2024/11/02 19:32:54 - [INFO] [3/68] using time `3.533s`.
+2024/11/02 19:32:54 - [INFO] [4/68] 000000000003 : `blue light, a black and white [cat] is playing with a flower` -> `blue light, a black and white [dog] is playing with a flower`
+2024/11/02 19:32:54 - [INFO] [4/68] source blend word is ``, target blend word is ``.
+2024/11/02 19:32:58 - [INFO] [4/68] using time `3.544s`.
+2024/11/02 19:32:58 - [INFO] [5/68] 000000000004 : `a cat sitting next to a mirror` -> `a [silver] cat [sculpture] sitting next to a mirror`
+2024/11/02 19:32:58 - [INFO] [5/68] source blend word is ``, target blend word is ``.
+2024/11/02 19:33:01 - [INFO] [5/68] using time `3.549s`.
+2024/11/02 19:33:01 - [INFO] [6/68] 000000000005 : `an [orange] cat sitting on top of a fence` -> `an [black] cat sitting on top of a fence`
+2024/11/02 19:33:01 - [INFO] [6/68] source blend word is ``, target blend word is ``.
+2024/11/02 19:33:05 - [INFO] [6/68] using time `3.549s`.
+2024/11/02 19:33:05 - [INFO] [7/68] 000000000006 : `a cup of coffee with drawing of [tulip] putted on the wooden table` -> `a cup of coffee with drawing of [lion] putted on the wooden table`
+2024/11/02 19:33:05 - [INFO] [7/68] source blend word is ``, target blend word is ``.
+2024/11/02 19:33:08 - [INFO] [7/68] using time `3.568s`.
+2024/11/02 19:33:09 - [INFO] [8/68] 000000000007 : `a german shepherd dog stands on the grass with mouth [closed]` -> `a german shepherd dog stands on the grass with mouth [opened]`
+2024/11/02 19:33:09 - [INFO] [8/68] source blend word is ``, target blend word is ``.
+2024/11/02 19:33:12 - [INFO] [8/68] using time `3.552s`.
+2024/11/02 19:33:12 - [INFO] [9/68] 000000000008 : `a golden retriever [holding a flower] sitting on the ground in front of fence` -> `a golden retriever sitting on the ground in front of fence`
+2024/11/02 19:33:12 - [INFO] [9/68] source blend word is ``, target blend word is ``.
+2024/11/02 19:33:16 - [INFO] [9/68] using time `3.558s`.
+2024/11/02 19:33:16 - [INFO] [10/68] 000000000009 : `a [dog] is laying down on a white background` -> `a [lion] is laying down on a white background`
+2024/11/02 19:33:16 - [INFO] [10/68] source blend word is ``, target blend word is ``.
+2024/11/02 19:33:19 - [INFO] [10/68] using time `3.552s`.
+2024/11/02 19:33:19 - [INFO] [11/68] 000000000010 : `photo of a [goat] and a cat standing on rocks near the ocean` -> `photo of a [horse] and a cat standing on rocks near the ocean`
+2024/11/02 19:33:19 - [INFO] [11/68] source blend word is ``, target blend word is ``.
+2024/11/02 19:33:23 - [INFO] [11/68] using time `3.563s`.
+2024/11/02 19:33:23 - [INFO] [12/68] 000000000011 : `a [colorful] bird standing on a branch` -> `a [red] bird standing on a branch`
+2024/11/02 19:33:23 - [INFO] [12/68] source blend word is ``, target blend word is ``.
+2024/11/02 19:33:26 - [INFO] [12/68] using time `3.558s`.
+2024/11/02 19:33:26 - [INFO] [13/68] 000000000012 : `meat [balls] on white plate` -> `meat [sushi] on white plate`
+2024/11/02 19:33:26 - [INFO] [13/68] source blend word is ``, target blend word is ``.
+2024/11/02 19:33:30 - [INFO] [13/68] using time `3.558s`.
+2024/11/02 19:33:30 - [INFO] [14/68] 000000000013 : `three white [dumplings] on brown bowl` -> `three white [sushi] on brown bowl`
+2024/11/02 19:33:30 - [INFO] [14/68] source blend word is ``, target blend word is ``.
+2024/11/02 19:33:33 - [INFO] [14/68] using time `3.565s`.
+2024/11/02 19:33:34 - [INFO] [15/68] 000000000014 : `a man with his hands [hanging down] standing by a house` -> `a man with his hands [rasing] standing by a house`
+2024/11/02 19:33:34 - [INFO] [15/68] source blend word is ``, target blend word is ``.
+2024/11/02 19:33:37 - [INFO] [15/68] using time `3.584s`.
+2024/11/02 19:33:37 - [INFO] [16/68] 000000000015 : `white plate with [fruits] on it` -> `white plate with [pizza] on it`
+2024/11/02 19:33:37 - [INFO] [16/68] source blend word is ``, target blend word is ``.
+2024/11/02 19:33:41 - [INFO] [16/68] using time `3.583s`.
+2024/11/02 19:33:41 - [INFO] [17/68] 000000000016 : `a plate with [steak] on it` -> `a plate with [salmon] on it`
+2024/11/02 19:33:41 - [INFO] [17/68] source blend word is ``, target blend word is ``.
+2024/11/02 19:33:44 - [INFO] [17/68] using time `3.581s`.
+2024/11/02 19:33:44 - [INFO] [18/68] 000000000017 : `photo of a statue [in front view]` -> `photo of a statue [in side view]`
+2024/11/02 19:33:44 - [INFO] [18/68] source blend word is ``, target blend word is ``.
+2024/11/02 19:33:48 - [INFO] [18/68] using time `3.582s`.
+2024/11/02 19:33:48 - [INFO] [19/68] 000000000018 : `the statue of liberty holding a [torch]` -> `the statue of liberty holding a [flower]`
+2024/11/02 19:33:48 - [INFO] [19/68] source blend word is ``, target blend word is ``.
