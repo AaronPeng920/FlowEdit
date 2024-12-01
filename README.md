@@ -59,7 +59,7 @@ python evaluate_afhq.py \
     --tgt_methods flowedit
 ```
 
-![Results](assets/result.jpg)
+![Results](assets/Result.jpg)
 
 ## Gradio Playground
 We implement interactive editor on web with Gradio, you can launch it via:
