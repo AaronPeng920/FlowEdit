@@ -1,0 +1,48 @@
+datasets:
+    source_root: datasets/afhq/afhq/val/cat
+    result_root: datasets/afhq_result/flowedit
+    source_prompt: cat
+    editing_prompt: dog
+    source_blend_words: ""
+    editing_blend_words: dog
+
+pipeline:
+    model_id_or_path: "stabilityai/stable-diffusion-3-medium"
+    dtype: float16
+    device: cuda:1            
+    image_resolution: 512    
+    attn_processors: -1,                                                    
+
+inference:
+    source_guidance_scale: 1.5                                              
+    target_guidance_scale: 6                                                    
+    num_inference_steps: 12                                                  
+    seed: 1823
+    denoise_model: False
+
+cross_replace:
+    cross_replace_enable_layers: 8:23,                                          
+    cross_start_step: 0.0                                                     
+    cross_end_step: 0.5                                                      
+
+self_process:
+    self_process_enable_layers: 8:23,                                      
+    self_start_step: 0.0                                                    
+    self_end_step: 0.0                                                     
+
+attn_store:
+    store_enable_layers: 0:8,                                                
+    store_start_step: 0.0                                                  
+    store_end_step: 1.0                                                    
+    attention_store_mode: clip2latent
+    visualize_attention_now: False
+
+local_blend:
+    use_local_blend: True                                                   
+    blend_start_step: 0.6                                                   
+    blend_end_step: 1.0                                                     
+    source_thresh: 0.4                                                      
+    target_thresh: 0.2                                                     
+    save_blend_mask: False
+
+

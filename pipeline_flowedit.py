@@ -14,6 +14,7 @@ from transformers import (
     T5TokenizerFast,
 )
 
+from diffusers import StableDiffusion3Pipeline
 from diffusers.image_processor import VaeImageProcessor, PipelineImageInput
 from diffusers.loaders import FromSingleFileMixin, SD3LoraLoaderMixin
 from diffusers.models.autoencoders import AutoencoderKL
@@ -146,15 +147,15 @@ def flow_consistency_sampler(
     sigma = scheduler.sigmas[scheduler.step_index]                  # sigma_t
     sigma_next = scheduler.sigmas[scheduler.step_index + 1]         # sigma_{t-1}
 
-
+    # Strategy 1
     v_gt = z_noise - z_gt    
     # For source branch
     v_src_res = v_gt - v_pred_src
     z_src_prev = z_src + (sigma_next - sigma) * (v_pred_src + v_src_res)
-    
     # For target branch
-    v_pred_tgt = v_pred_tgt + v_src_res
-    z_tgt_prev = z_tgt + (sigma_next - sigma) * v_pred_tgt
+    v_pred_tgt_update = v_pred_tgt + v_src_res
+    z_tgt_prev = z_tgt + (sigma_next - sigma) * v_pred_tgt_update
+    
     
     # Cast sample back to model compatible dtype
     z_src_prev = z_src_prev.to(v_pred_src_dtype)
@@ -163,9 +164,8 @@ def flow_consistency_sampler(
     # upon completion increase step index by one
     scheduler._step_index += 1
     
-    
     return z_tgt_prev, z_src_prev
-    
+
 class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixin):
     r"""
     Args:
@@ -356,7 +356,7 @@ class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixi
 
         return prompt_embeds, pooled_prompt_embeds
     
-    # Copied from diffusers.pipelines.stable_diffusion_3.StableDiffusion3Pipeline.encode_prompt()
+    # Copied and revised from diffusers.pipelines.stable_diffusion_3.StableDiffusion3Pipeline.encode_prompt()
     def encode_prompt(
         self,
         prompt: Union[str, List[str]],
@@ -456,6 +456,9 @@ class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixi
                 clip_skip=clip_skip,
                 clip_model_index=0,
             )
+
+            clip_pooled_prompt_embed = pooled_prompt_embed
+
             prompt_2_embed, pooled_prompt_2_embed = self._get_clip_prompt_embeds(
                 prompt=prompt_2,
                 device=device,
@@ -548,7 +551,7 @@ class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixi
                 # Retrieve the original scale by scaling back the LoRA layers
                 unscale_lora_layers(self.text_encoder_2, lora_scale)
 
-        return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
+        return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds, clip_pooled_prompt_embed
     
     # Copied and revised from diffusers.pipelines.stable_diffusion_3.StableDiffusion3Pipeline.check_inputs()
     def check_inputs(
@@ -704,6 +707,24 @@ class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixi
 
         return latents, clean_latents
     
+    # Get text semantic distance between target prompt and source prompt
+    def get_semantic_distance(
+        self,
+        target_clip_pooled_prompt_embed: torch.Tensor,
+        source_clip_pooled_prompt_embed: torch.Tensor
+    ):
+        target_text_features = self.text_encoder.text_projection(target_clip_pooled_prompt_embed)
+        source_text_features = self.text_encoder.text_projection(source_clip_pooled_prompt_embed)
+        len_prompt = target_text_features.shape[0]
+        semantic_distances = torch.ones(len_prompt).to(dtype=target_clip_pooled_prompt_embed.dtype, device=target_clip_pooled_prompt_embed.device)
+        for i in range(len_prompt):
+            text_feature1 = target_text_features[i].unsqueeze(0)
+            text_feature2 = source_text_features[i].unsqueeze(0)
+            similarity = torch.nn.functional.cosine_similarity(text_feature1, text_feature2)
+            distance = 1 - similarity
+            semantic_distances[i] = distance
+        return semantic_distances
+
     @property
     def guidance_scale(self):
         return self._guidance_scale
@@ -721,7 +742,7 @@ class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixi
     # corresponds to doing no classifier free guidance.
     @property
     def do_classifier_free_guidance(self):
-        return self._guidance_scale > 1
+        return True
 
     @property
     def source_do_classifier_free_guidance(self):
@@ -937,6 +958,7 @@ class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixi
             negative_prompt_embeds,                         # [B, 333, 4096] or [B, 154, 4096]
             pooled_prompt_embeds,                           # [B, 2048]
             negative_pooled_prompt_embeds,                  # [B, 2048]
+            target_clip_pooled_prompt_embeds                # [B, 768]
         ) = self.encode_prompt(
             prompt=prompt,
             prompt_2=prompt_2,
@@ -961,6 +983,7 @@ class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixi
             source_negative_prompt_embeds,                         # [B, 333, 4096] or [B, 154, 4096]
             source_pooled_prompt_embeds,                           # [B, 2048]
             source_negative_pooled_prompt_embeds,                  # [B, 2048]
+            source_clip_pooled_prompt_embeds                       # [B, 768]
         ) = self.encode_prompt(
             prompt=source_prompt,
             prompt_2=source_prompt_2,
@@ -986,7 +1009,11 @@ class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixi
             # pooled_prompt_embeds = torch.cat([negative_pooled_prompt_embeds, negative_pooled_prompt_embeds, pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
         else:
             prompt_embeds = torch.cat([prompt_embeds, source_prompt_embeds], dim=0)
-        
+
+        # semantic_distances = self.get_semantic_distance(target_clip_pooled_prompt_embeds, source_clip_pooled_prompt_embeds)
+        # use_soft_guidance = True
+        # if use_soft_guidance:
+        #     guidance_scale =  (1 - semantic_distances[0]) * (7 - 2) + 2
         image = self.image_processor.preprocess(image)
         
         # 4. Prepare timesteps
@@ -1066,8 +1093,8 @@ class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixi
                 latents_dtype = latents.dtype
                 
                 # # For Normal Sampling
-                # latents_output = self.scheduler.step(noise_pred, t, latents_input, return_dict=False)[0]
-                # latents, source_latents = latents_output.chunk(2, dim=0)
+                    # latents_output = self.scheduler.step(noise_pred, t, latents_input, return_dict=False)[0]
+                    # latents, source_latents = latents_output.chunk(2, dim=0)
                 
                 # # For Flow Consistency Sampling
                 target_noise_pred, source_noise_pred = noise_pred.chunk(2, dim=0)
@@ -1081,7 +1108,6 @@ class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixi
                     timestep = t,
                     scheduler = self.scheduler
                 )
-                
                 
                 if latents.dtype != latents_dtype:
                     if torch.backends.mps.is_available():
@@ -1109,7 +1135,8 @@ class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixi
 
                 if XLA_AVAILABLE:
                     xm.mark_step()
-
+      
+                
         if output_type == "latent":
             image = latents
             if return_source:
@@ -1136,53 +1163,3 @@ class FlowEditPipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingleFileMixi
             return FlowEditPipelineOutput(images=image), FlowEditPipelineOutput(images=source_image)
         else:
             return FlowEditPipelineOutput(images=image)
-    
-    
-if __name__ == '__main__':
-    from utils import save_inter_latents_callback
-    
-    IMAGE_RESOLUTION = 512
-    USE_T5 = False
-    FLOAT16 = True
-    
-    T5_desc = "USE" if USE_T5 else "Do not USE"
-    float16_desc = "torch.float16" if FLOAT16 else "torch.float32"
-    print( "===================== FlowEditPipeline Sampling Test =====================")
-    print(f"* Sampled Image Resolution: {IMAGE_RESOLUTION} x {IMAGE_RESOLUTION}")
-    print(f"* {T5_desc} T5 Text Encoder")
-    print(f"* Inferencing with {float16_desc}")
-    print( "===================== FlowEditPipeline Sampling Test =====================")
-    
-    
-    model_id_or_path = "/data/pengzhengwei/checkpoints/stablediffusion/v3"
-    torch_dtype = torch.float16 if FLOAT16 else torch.float32
-    device = "cuda:5"
-
-    if USE_T5:
-        pipe = FlowEditPipeline.from_pretrained(
-            model_id_or_path,
-            torch_dtype=torch_dtype
-        ).to(device)
-    else:
-        pipe = FlowEditPipeline.from_pretrained(
-            model_id_or_path,
-            text_encoder_3=None,
-            tokenizer_3=None,
-            torch_dtype=torch_dtype
-        ).to(device)
-    
-    source_image = PIL.Image.open("assets/girl_dog.png").convert('RGB').resize([IMAGE_RESOLUTION, IMAGE_RESOLUTION])
-    images, source_images = pipe(
-        prompt="A girl is feeding a dog",
-        image=source_image,
-        source_prompt="A girl is feeding a cat",
-        num_inference_steps=25,
-        height=IMAGE_RESOLUTION,
-        width=IMAGE_RESOLUTION,
-        denoise_model=True,
-        return_source=True,
-        callback_on_step_end=save_inter_latents_callback
-    )
-    
-    images.images[0].save("target.png")
-    source_images.images[0].save("source.png")

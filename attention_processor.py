@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image
 from diffusers import StableDiffusion3Pipeline
 from utils import generate_mask
+from sklearn.decomposition import PCA
 
 # Copied and revised from torch.nn.functional.scaled_dot_product_attention()
 def scaled_dot_product_attention(
@@ -64,7 +65,7 @@ class JointAttnStore:
 
     def __init__(
         self, 
-        name: Optional[str] = "",
+        layer_id: Optional[int] = -1,
         image_resolution: Optional[int] = 512,
         has_text_encoder_3: Optional[bool] = False,
         mode: Optional[str] = "all",
@@ -76,7 +77,7 @@ class JointAttnStore:
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
         self.step_attn_store = []
         self.cur_step = 0
-        self.name = name
+        self.layer_id = layer_id
         self.image_resolution = image_resolution
         self.has_text_encoder_3 = has_text_encoder_3
         self.mode = mode
@@ -148,7 +149,7 @@ class JointAttnStore:
         if not self.visualize_now:
             self.step_attn_store.append(attn_weight) 
         else: 
-            visualize_attention([attn_weight], [self.cur_step], self.image_resolution, self.has_text_encoder_3, self.mode, self.name, **self.extra_args)
+            visualize_attention([attn_weight], [self.cur_step], self.image_resolution, self.has_text_encoder_3, self.mode, f"layer{self.layer_id}", **self.extra_args)
             self.cur_step += 1
 
         hidden_states = hidden_states.view(batch_size, -1, inner_dim)       # [B, HW, C]
@@ -182,12 +183,10 @@ def register_attention_processor(
     class FlowEditAttentionProcessor:
         def __init__(
             self, 
-            layer_id: Optional[int] = None,
-            enable: Optional[bool] = False,
+            layer_id: Optional[int] = -1,
             **kwargs
         ):
             self.layer_id = layer_id
-            self.enable = enable
             
         # Copied and revised from diffusers.models.attention_processor.JointAttnProcessor2_0.__call__()
         def __call__(
@@ -233,14 +232,15 @@ def register_attention_processor(
             key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)        
             value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)    
             
-            if self.enable:
-                query, key, value = controller.process_qkv(query, key, value)
-            
+            # process query, key and value
+            query, key, value = controller.process_qkv(self.layer_id, query, key, value)
+
+            # compute scaled dot product attention
             attn_weight, value = scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)        # [B, h, L, L], [B, h, L, C // h]
             
-            if self.enable:
-                attn_weight, value = controller(attn_weight, value)
-                
+            # cross attention replace
+            attn_weight, value = controller(self.layer_id, attn_weight, value)
+            
             hidden_states = attn_weight @ value
             hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)                            # [B, L, C]
             hidden_states = hidden_states.to(query.dtype)
@@ -267,23 +267,24 @@ def register_attention_processor(
     
     # Set default filter
     if filter is None:
-        filter = lambda attn_processor_i, attn_processor_name: True
+        filter = lambda attn_processor_i, attn_processor_name: False
     
     attn_processors = model.attn_processors
     attn_processor_names = list(attn_processors.keys())
     setted_attn_processors = {}
-    registered_attn_processor_names = []
+    registered_attn_processor_layer_ids = []
     registered_attn_processors_count = 0
     for attn_processor_i, attn_processor_name in enumerate(attn_processor_names):
         if filter(attn_processor_i, attn_processor_name):
-            setted_attn_processors[attn_processor_name] = FlowEditAttentionProcessor(layer_id=attn_processor_i, enable=True)
+            setted_attn_processors[attn_processor_name] = FlowEditAttentionProcessor(layer_id=attn_processor_i)
             registered_attn_processors_count += 1
-            registered_attn_processor_names.append(attn_processor_name)
+            registered_attn_processor_layer_ids.append(attn_processor_i)
         else:
             setted_attn_processors[attn_processor_name] = attn_processors[attn_processor_name]
     model.set_attn_processor(setted_attn_processors)
     controller.num_att_layers = registered_attn_processors_count
-    return registered_attn_processor_names, registered_attn_processors_count
+    controller.registered_layer_ids = registered_attn_processor_layer_ids
+    return registered_attn_processor_layer_ids, registered_attn_processors_count
     
 
 def register_attention_store(
@@ -307,7 +308,7 @@ def register_attention_store(
     for attn_processor_i, attn_processor_name in enumerate(attn_processor_names):
         if filter(attn_processor_i, attn_processor_name):
             setted_attn_processors[attn_processor_name] = JointAttnStore(
-                name=f"layer{attn_processor_i}", 
+                layer_id=attn_processor_i, 
                 image_resolution=image_resolution,
                 has_text_encoder_3=has_text_encoder_3,
                 mode=mode,
@@ -355,11 +356,12 @@ def visualize_attention(
             mode: attention mode
         """ 
         if mode == "select":
-            select_index = kwargs.pop("index")
+            select_index = kwargs.get("index", None)
             attn_map = attn_map[:, select_index]        # for latent2clip
             # attn_map = attn_map[select_index, :]        # for clip2latent
             H = W = int(attn_map.shape[0] ** 0.5)       
             attn_map = attn_map.view(H, W)
+
         attn_map = attn_map.cpu().numpy()
         attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min())      # normalization
         attn_map_gray = (attn_map * 255).astype(np.uint8)                               # 0 for black, 255 for white
@@ -417,127 +419,3 @@ def visualize_attention(
         else:
             raise ValueError(f"Unsupport visualization mode of `{mode}`.")
         
-    
-if __name__ == '__main__':
-    """DEMO
-        python attention_processor.py \
-            --image_resolution 512 \
-            --use_t5 \
-            --mode 'select' \
-            --visualize_now \
-            --prompt 'a photo of a cat and a dog' \
-            --num_inference_steps 25 \
-            --index  5 \
-            --save_dynamic \
-            --fps 10
-    """
-    
-    import logging
-    import argparse
-    from utils import convert_attention_maps_to_video
-    
-    model_id_or_path = "/data/pengzhengwei/checkpoints/stablediffusion/v3"
-    torch_dtype = torch.float16
-    device = "cuda:5"
-    
-    logging.basicConfig(
-        level=logging.DEBUG, 
-        datefmt='%Y/%m/%d %H:%M:%S', 
-        format='%(asctime)s - [%(levelname)s] %(message)s', 
-        filename="logs/attention_visualization.log", 
-        filemode='w'
-    )
-    logger = logging.getLogger("AttentionStore")
-    
-    parser = argparse.ArgumentParser(description="Visualize Attention in MM-DiT")
-    parser.add_argument('--image_resolution', type=int, default=512, help="Image resolution")
-    parser.add_argument('--use_t5', action='store_true', default=False, help="Use T5 XXL text encoder")
-    parser.add_argument('--mode', type=str, default='all', help="Attention saving mode")
-    parser.add_argument('--visualize_now', action='store_true', default=False, help="Visualize attention map right now (may be slow)")
-    parser.add_argument('--index', type=int, default=0, help="Token index for select mode")
-    parser.add_argument('--prompt', type=str, default="", help="Source prompt")
-    parser.add_argument('--num_inference_steps', type=int, default=25, help="Number of inference steps")
-    parser.add_argument('--seed', type=int, default=319, help="Generator seed.")
-    parser.add_argument('--filter_ids', type=int, nargs='*', default=list(np.arange(24)), help="Registered attention layer ids.")
-    parser.add_argument('--save_dynamic', action="store_true", default=False, help="Saving dynamic attention changes")
-    parser.add_argument('--fps', type=int, default=5, help="Frames per second of dynamic attention changes video")
-    parser.add_argument('--mask_type', type=str, default="", help="Attention mask type")
-    args = parser.parse_args()
-    
-    if len(args.filter_ids) == 1 and args.filter_ids[0] == -1:
-        args.filter_ids = list(np.arange(24))
-        
-    logger.info("============================ Visualize Attention in MM-DiT ============================")
-    logger.info(f"The image resolution is `{args.image_resolution}`.")
-    if args.use_t5:
-        logger.info(f"Using T5 XXL text encoder.")
-    else:
-        logger.info(f"Not using T5 XXL text encoder.")
-    logger.info(f"The selected after filter attention processor ids is `{args.filter_ids}`.")
-    logger.info(f"Attention visualization mode is `{args.mode}`.")
-    if args.visualize_now:
-        logger.info("Visualizing attention maps in real time, saving at `inters/attentions/`")
-    if args.mode == "select":
-        logger.info(f"The selected token index is `{args.index}`")
-    
-    if args.use_t5:
-        pipe = StableDiffusion3Pipeline.from_pretrained(
-            model_id_or_path,
-            torch_dtype=torch_dtype
-        ).to(device)
-    else:
-        pipe = StableDiffusion3Pipeline.from_pretrained(
-            model_id_or_path,
-            text_encoder_3=None,
-            tokenizer_3=None,
-            torch_dtype=torch_dtype
-        ).to(device)
-    
-    logger.info(f"Loaded model from `{model_id_or_path}` successfully, inferencing with `{torch_dtype}` on `{device}`.")
-    
-    kwargs = {
-        "index": args.index
-    }
-
-    def filter(attn_processor_i, attn_process_name):
-        if attn_processor_i in args.filter_ids:
-            return True
-        else:
-            return False
-        
-    registered_attn_processor_names, registered_attn_processors_count = register_attention_store(
-        pipe.transformer,
-        filter=filter,
-        image_resolution=args.image_resolution,
-        has_text_encoder_3=args.use_t5,
-        mode=args.mode,
-        visualize_now=args.visualize_now,
-        mask_type=args.mask_type,
-        **kwargs
-    )
-    logger.info(f"Registered `{registered_attn_processors_count}` attention processors, namely `{registered_attn_processor_names}`.")
-    logger.info(f"Attention mask type is set to `{args.mask_type}`.")
-    
-    generator = torch.manual_seed(args.seed)
-    logger.info(f"Using seed of `{args.seed}`.")
-    logger.info(f"The prompt is `{args.prompt}`, sampling `{args.num_inference_steps}` steps.")
-    images = pipe(
-        prompt=args.prompt,
-        num_inference_steps=args.num_inference_steps,
-        generator=generator,
-        height=args.image_resolution,
-        width=args.image_resolution
-    ).images
-    images[0].save("sample.png")
-    logger.info("Sampling done and saved at `sample.png`.")
-    
-    if args.save_dynamic:
-        output_video_names, output_video_count = convert_attention_maps_to_video(
-            "inters/attentions",
-            read_flag="gray",
-            fps=args.fps
-        )
-        logger.info(f"Has made `{output_video_count}` attention dynamic change videos with `{args.fps}` fps, namely `{output_video_names}`.")
-        
-    
-    

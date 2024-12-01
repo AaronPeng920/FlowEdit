@@ -1,3 +1,4 @@
+import PIL.Image
 import cv2
 import os
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -8,6 +9,8 @@ from tqdm import tqdm
 import torch
 from pipeline_flowedit import FlowEditPipeline
 import PIL
+import json
+from pathlib import Path
 
 def convert_attention_maps_to_video(
     attention_maps_image_folder: str,
@@ -319,11 +322,63 @@ def combine_images_with_captions(
     draw.text((x2, 10), caption2, font=font, fill=(255, 100, 0))  # 图像2的标题
 
     return new_image
+
+def combine_benchmark_images_with_captions(
+    source_images_dir: str,
+    result_images_dir: str,
+    output_images_dir: str,
+    annotation_filename: str,
+    image_size: Optional[List[int]] = None,
+    font_size: Optional[int] = 40
+):
+    if not os.path.exists(output_images_dir):
+        os.makedirs(output_images_dir)
+    mapping = json.load(open(annotation_filename, 'r'))
+    
+    def walk_dir(source_dir, result_dir, output_dir, mapping, count=0):
+        if not (os.path.exists(source_dir) and os.path.exists(result_dir) and os.path.exists(output_dir)):
+            return count
+        contents = os.listdir(source_dir)
+        
+        for content in contents:
+            if os.path.isdir(os.path.join(source_dir, content)):
+                source_sub_dir = os.path.join(source_dir, content)
+                result_sub_dir = os.path.join(result_dir, content)
+                output_sub_dir = os.path.join(output_dir, content)
+                if not os.path.exists(output_sub_dir):
+                    os.makedirs(output_sub_dir)
+                count = walk_dir(source_sub_dir, result_sub_dir, output_sub_dir, mapping, count)
+            else:
+                source_image_filename = os.path.join(source_dir, content)
+                result_image_filename = os.path.join(result_dir, content)
+                output_image_filename = os.path.join(output_dir, content)
+                
+                source_image = PIL.Image.open(source_image_filename).convert('RGB')
+                result_image = PIL.Image.open(result_image_filename).convert('RGB')
+                source_prompt = mapping[Path(content).stem]['original_prompt']
+                result_prompt = mapping[Path(content).stem]['editing_prompt']
+                output_image = combine_images_with_captions(source_image, source_prompt, result_image, result_prompt)
+                output_image.save(output_image_filename)
+                count += 1
+        return count
+                    
+    count = walk_dir(source_images_dir, result_images_dir, output_images_dir, mapping, 0)
+    return count
+    
+def parse_string_to_processor_id(processors_string: str, max_count: int = 24):
+    if "-1" in processors_string:
+        return list(range(0, max_count))
+    else:
+        processors_id = []
+        segments = processors_string.split(',')
+        for segment in segments:
+            if segment == "":
+                continue
+            elif ':' in segment:
+                start, end = [int(eval(n)) for n in segment.split(':')]
+                start, end = min(start, end), max(start, end)
+                processors_id.extend(list(range(start, end+1)))
+            else:
+                processors_id.append(int(eval(segment)))
+        return processors_id
             
-if __name__ == '__main__':
-    saved_video_names, count = convert_attention_maps_to_video(
-        "/home/pengzhengwei/projects/FlowEdit/inters/attentions",
-        fps=1,
-        by_layer=False
-    )
-    print(count)

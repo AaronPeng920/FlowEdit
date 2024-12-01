@@ -161,7 +161,6 @@ class AttentionControl(abc.ABC):
             self.between_steps(layer_id)
             self.cur_att_layer = 0
             self.cur_step += 1
-            
         return attn_weight, value
 
     def reset(self):
@@ -458,7 +457,7 @@ class AttentionRefine(AttentionControlEdit):
         
         return attn_target
 
-    def process_qkv(self, layer_id: int, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor): 
+    def process_qkv(self, layer_id: int, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):     
         clip_l = 77
         t5_l = 256 if self.has_text_encoder_3 else 77
         latent_l = (self.image_resolution // 8 // 2) ** 2
@@ -718,13 +717,13 @@ if __name__ == '__main__':
         level=logging.DEBUG, 
         datefmt='%Y/%m/%d %H:%M:%S', 
         format='%(asctime)s - [%(levelname)s] %(message)s', 
-        filename="logs/evaluate_pie_benchmark.log", 
+        filename="logs/evaluate_afhq_benchmark.log", 
         filemode='w'
     )
     logger = logging.getLogger("FlowEdit")
 
     # 2. Config
-    config = yaml.load(open("configs/evaluate_pie.yaml"), Loader=yaml.FullLoader)
+    config = yaml.load(open("configs/evaluate_afhq.yaml"), Loader=yaml.FullLoader)
     
     model_id_or_path = config['pipeline']['model_id_or_path']
     torch_dtype = torch.float16 if config['pipeline']['dtype'] == 'float16' else torch.float32
@@ -754,18 +753,17 @@ if __name__ == '__main__':
     # 3. Preparing dataset
     source_root = inference_params['source_root']
     result_root = inference_params['result_root']
-    source_images_dir = os.path.join(source_root, "annotation_images")
-    annotation_file = os.path.join(source_root, "mapping_file.json")
-    with open(annotation_file) as f:
-        annotations = json.load(f)
-    annotation_count = len(annotations)
-    
-    result_images_dir = os.path.join(result_root, "annotation_images")
-    if not os.path.exists(result_images_dir):
-        os.makedirs(result_images_dir, exist_ok=True)
+    source_prompt = inference_params.pop('source_prompt', "")
+    target_prompt = inference_params.pop('editing_prompt', "")
+    source_blend_word = inference_params.pop('source_blend_words', "")
+    target_blend_word = inference_params.pop('editing_blend_words', "")
+    source_image_filenames = os.listdir(source_root)
+    case_count = len(source_image_filenames)
+    if not os.path.exists(result_root):
+        os.makedirs(result_root, exist_ok=True)
     
     # 4. Preparing all params
-    logger.info("===================== PIE BenchMark Test =====================")
+    logger.info("===================== AFHQ BenchMark Test =====================")
     logger.info(f"Using Image Resolution `{inference_params['image_resolution']}`.")
     logger.info(f"Num inference steps is `{inference_params['num_inference_steps']}`, using generator seed `{inference_params['seed']}`.")
     logger.info(f"Source guidance scale is `{inference_params['source_guidance_scale']}`, target guidance scale is `{inference_params['target_guidance_scale']}`.")
@@ -779,25 +777,13 @@ if __name__ == '__main__':
         logger.info("Not using local blend.")
     logger.info("==============================================================")
     
-    for i, (item_idx, annotation)  in enumerate(annotations.items()):
-        image_path = os.path.join(source_images_dir, annotation["image_path"])
+    for i, image_filename  in enumerate(source_image_filenames):
+        image_path = os.path.join(source_root, image_filename)
         image = Image.open(image_path).convert("RGB")
         
-        source_prompt = annotation["original_prompt"].replace('[', "").replace("]", "")
-        target_prompt = annotation["editing_prompt"].replace('[', "").replace("]", "")
         
-        editing_type = int(annotation["editing_type_id"])
-        
-        blended_words = annotation["blended_word"].split()
-        if len(blended_words) == 2:
-            source_blend_word = ""
-            target_blend_word = blended_words[1]
-        else:
-            source_blend_word = ""
-            target_blend_word = ""
-        
-        logger.info(f"[{i+1}/{annotation_count}] {item_idx} : `{source_prompt}` -> `{target_prompt}`")
-        logger.info(f"[{i+1}/{annotation_count}] source blend word is `{source_blend_word}`, target blend word is `{target_blend_word}`.")
+        logger.info(f"[{i+1}/{case_count}] {image_filename} : `{source_prompt}` -> `{target_prompt}`")
+        logger.info(f"[{i+1}/{case_count}] source blend word is `{source_blend_word}`, target blend word is `{target_blend_word}`.")
 
         # 5. Inference
         result, source, _, duration = inference(
@@ -809,12 +795,9 @@ if __name__ == '__main__':
             **inference_params
         )
 
-        logger.info(f"[{i+1}/{annotation_count}] using time `{duration}s`.")
+        logger.info(f"[{i+1}/{case_count}] using time `{duration}s`.")
         
-        output_filename = os.path.join(result_root, "annotation_images", annotation["image_path"])
-        output_dir = os.path.dirname(output_filename)
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir, exist_ok=True)
+        output_filename = os.path.join(result_root, image_filename)
         result.save(output_filename)
         
         

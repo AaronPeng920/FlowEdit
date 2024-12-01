@@ -1,7 +1,5 @@
 import warnings
-import os
-import argparse
-import json
+import gradio as gr
 import torch
 from pipeline_flowedit import FlowEditPipeline
 from attention_processor import register_attention_processor, visualize_attention
@@ -12,9 +10,13 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from sklearn.decomposition import PCA
 from PIL import Image
 import numpy as np
-import time
-from utils import combine_images_with_captions
 import torch.nn.functional as nnf
+import time
+from utils import combine_images_with_captions, save_inter_latents_callback, parse_string_to_processor_id
+import yaml
+import json
+import os
+import argparse
 
 # Copied and revised from https://github.com/sled-group/InfEdit/blob/main/app_infedit/LocalBlend
 class LocalBlend:
@@ -593,7 +595,7 @@ def inference(
     num_inference_steps: Optional[int] = 15,
     image_resolution: Optional[int] = 512,
     seed: Optional[int] = None,
-    attention_processor_filter: Optional[Callable] = None,
+    attn_enable_layers: Optional[list] = list(range(24)),
     denoise_model: Optional[bool] = False,
     
     store_enable_layers: Optional[list] = list(range(24)),
@@ -629,7 +631,7 @@ def inference(
     
     if seed is not None:
         generator = torch.manual_seed(seed)
-        logger.info(f"Set seed to `{seed}`.")
+
     else:
         generator = None
     if use_local_blend:
@@ -675,8 +677,10 @@ def inference(
         torch_dtype=torch_dtype,
         **kwargs
     )
+    def attn_processor_filter(attn_processor_i, attn_processor_name):
+        return True if attn_processor_i in attn_enable_layers else False
     
-    registered_attn_processor_names, registered_attn_processors_count = register_attention_processor(pipe.transformer, controller, attention_processor_filter)
+    registered_attn_processor_names, registered_attn_processors_count = register_attention_processor(pipe.transformer, controller, attn_processor_filter)
 
     if use_local_blend:
         callback_on_step_end = controller.callback_on_step_end
@@ -708,127 +712,161 @@ def inference(
     source_images = source.images
 
     return result_images[0], source_images[0], controller, duration
-    
-if __name__ == '__main__':
-    from utils import save_inter_latents_callback, parse_string_to_processor_id
-    import yaml
 
-    # 1. Logging
-    logging.basicConfig(
-        level=logging.DEBUG, 
-        datefmt='%Y/%m/%d %H:%M:%S', 
-        format='%(asctime)s - [%(levelname)s] %(message)s', 
-        filename="logs/evaluate_pie_benchmark.log", 
-        filemode='w'
+def edit(
+    source_image,
+    source_prompt,
+    source_guidance_scale,
+    source_blend_words,
+    source_blend_thresh,
+    
+    target_prompt,
+    target_guidance_scale,
+    target_blend_words,
+    target_blend_thresh,
+    
+    attn_layers,
+    store_layers,
+    cross_layers,
+    self_layers,
+    
+    store_start_step,
+    store_end_step,
+    cross_start_step,
+    cross_end_step,
+    self_start_step,
+    self_end_step,
+    blend_start_step,
+    blend_end_step,
+    
+    seed,
+    num_inference_steps
+):
+    image_resolution = 512
+    denoise_model = False
+    attn_store_mode = "clip2latent"
+    visualize_attention = False
+    use_local_blend = True
+    save_blend_mask = False
+    callback_on_step_end = None
+    torch_dtype = torch.float16
+    device = "cuda:5"
+    result_image, source_image, controller, duration = inference(
+        source_image, source_prompt, target_prompt, source_guidance_scale, target_guidance_scale, int(num_inference_steps), image_resolution,
+        int(seed), attn_layers, denoise_model, store_layers, store_start_step, store_end_step, attn_store_mode, visualize_attention, use_local_blend,
+        source_blend_words, target_blend_words, blend_start_step, blend_end_step, source_blend_thresh, target_blend_thresh, save_blend_mask,
+        cross_layers, cross_start_step, cross_end_step, self_layers, self_start_step, self_end_step, callback_on_step_end, torch_dtype, device
     )
-    logger = logging.getLogger("FlowEdit")
+    return result_image
 
-    # 2. Config
-    config = yaml.load(open("configs/evaluate_pie.yaml"), Loader=yaml.FullLoader)
+if __name__ == '__main__':
+    model_id_or_path = "stabilityai/stable-diffusion-3-medium"
+    torch_dtype = torch.float16 
+    device = "cuda:0"
     
-    model_id_or_path = config['pipeline']['model_id_or_path']
-    torch_dtype = torch.float16 if config['pipeline']['dtype'] == 'float16' else torch.float32
-    device = config['pipeline']['device']
-
-    inference_params = {}
-    for sub_name, sub_config in config.items():
-        for k, v in sub_config.items():
-            inference_params[k] = v
-    inference_params["attn_processors"] = parse_string_to_processor_id(inference_params["attn_processors"])
-    def attn_processor_filter(attn_processor_i, attn_processor_name):
-        return True if attn_processor_i in inference_params['attn_processors'] else False
-    inference_params['attention_processor_filter'] = attn_processor_filter
-    inference_params["cross_replace_enable_layers"] = parse_string_to_processor_id(inference_params["cross_replace_enable_layers"])
-    inference_params["self_process_enable_layers"] = parse_string_to_processor_id(inference_params["self_process_enable_layers"])
-    inference_params["store_enable_layers"] = parse_string_to_processor_id(inference_params["store_enable_layers"])
-    
-    # 3. Loading pipeline
     pipe = FlowEditPipeline.from_pretrained(
-            model_id_or_path,
-            text_encoder_3=None,
-            tokenizer_3=None,
-            torch_dtype=torch_dtype
-        ).to(device)
-    logger.info(f"Load FlowEditPipeline from `{model_id_or_path}` successfully, inferencing with `{torch_dtype}` on `{device}`.")
-
-    # 3. Preparing dataset
-    source_root = inference_params['source_root']
-    result_root = inference_params['result_root']
-    source_images_dir = os.path.join(source_root, "annotation_images")
-    annotation_file = os.path.join(source_root, "mapping_file.json")
-    with open(annotation_file) as f:
-        annotations = json.load(f)
-    annotation_count = len(annotations)
+        model_id_or_path,
+        text_encoder_3=None,
+        tokenizer_3=None,
+        torch_dtype=torch_dtype
+    ).to(device)
     
-    result_images_dir = os.path.join(result_root, "annotation_images")
-    if not os.path.exists(result_images_dir):
-        os.makedirs(result_images_dir, exist_ok=True)
-    
-    # 4. Preparing all params
-    logger.info("===================== PIE BenchMark Test =====================")
-    logger.info(f"Using Image Resolution `{inference_params['image_resolution']}`.")
-    logger.info(f"Num inference steps is `{inference_params['num_inference_steps']}`, using generator seed `{inference_params['seed']}`.")
-    logger.info(f"Source guidance scale is `{inference_params['source_guidance_scale']}`, target guidance scale is `{inference_params['target_guidance_scale']}`.")
-    logger.info(f"Registering `{inference_params['attn_processors']}` attention processors.")
-    logger.info(f"Attention store enable layers are `{inference_params['store_enable_layers']}`, start step is `{inference_params['store_start_step']}`, end step is `{inference_params['store_end_step']}`.")
-    logger.info(f"Cross attention replace enable layers are `{inference_params['cross_replace_enable_layers']}`, start step is `{inference_params['cross_start_step']}`, end step is `{inference_params['cross_end_step']}`.")
-    logger.info(f"Self attention process enable layers are `{inference_params['self_process_enable_layers']}`, start step is `{inference_params['self_start_step']}`, end step is `{inference_params['self_end_step']}`.")
-    if inference_params['use_local_blend']:
-        logger.info(f"Using local blend, start step is `{inference_params['blend_start_step']}`, end step is `{inference_params['blend_end_step']}`, source thresh is `{inference_params['source_thresh']}`, target thresh is `{inference_params['target_thresh']}`.")
-    else:
-        logger.info("Not using local blend.")
-    logger.info("==============================================================")
-    
-    for i, (item_idx, annotation)  in enumerate(annotations.items()):
-        image_path = os.path.join(source_images_dir, annotation["image_path"])
-        image = Image.open(image_path).convert("RGB")
-        
-        source_prompt = annotation["original_prompt"].replace('[', "").replace("]", "")
-        target_prompt = annotation["editing_prompt"].replace('[', "").replace("]", "")
-        
-        editing_type = int(annotation["editing_type_id"])
-        
-        blended_words = annotation["blended_word"].split()
-        if len(blended_words) == 2:
-            source_blend_word = ""
-            target_blend_word = blended_words[1]
-        else:
-            source_blend_word = ""
-            target_blend_word = ""
-        
-        logger.info(f"[{i+1}/{annotation_count}] {item_idx} : `{source_prompt}` -> `{target_prompt}`")
-        logger.info(f"[{i+1}/{annotation_count}] source blend word is `{source_blend_word}`, target blend word is `{target_blend_word}`.")
-
-        # 5. Inference
-        result, source, _, duration = inference(
-            image,
-            source_prompt,
-            target_prompt,
-            source_blended_words=source_blend_word,
-            target_blended_words=target_blend_word,
-            **inference_params
+    with gr.Blocks() as flowedit_demo:
+        gr.HTML("<center><h1>FlowEdit</h1></center>")
+        with gr.Column():
+            with gr.Group():
+                source_image = gr.Image(label="Source image", type="pil")
+                result_image = gr.Image(label="Edited image", type="pil")
+                
+        with gr.Column():
+            with gr.Tabs():
+                with gr.TabItem("Setting"):
+                    with gr.Group():
+                        with gr.Row():
+                            source_prompt = gr.Textbox(label="Source prompt", value="", interactive=True)
+                            source_guidance_scale = gr.Slider(label="Source guidance scale", value=1.5, minimum=1, maximum=10, interactive=True)
+                        with gr.Row():
+                            source_blend_words = gr.Textbox(label="Source blend words", value="", interactive=True)
+                            source_blend_thresh = gr.Number(label="Source blend thresh", value=0.4, minimum=0.0, maximum=1.0, step=0.05, interactive=True)
+                            
+                    with gr.Group():
+                        with gr.Row():
+                            target_prompt = gr.Textbox(label="Target prompt", value="", interactive=True)
+                            target_guidance_scale = gr.Slider(label="Target guidance scale", value=3.5, minimum=1, maximum=10, interactive=True)
+                        with gr.Row():
+                            target_blend_words = gr.Textbox(label="Target blend words", value="", interactive=True)
+                            target_blend_thresh = gr.Number(label="Target blend thresh", value=0.2, minimum=0.0, maximum=1.0, step=0.05, interactive=True)
+                        
+                    with gr.Group():
+                        with gr.Row():
+                            seed = gr.Number(label="Seed", value=1823, interactive=True)
+                            num_inference_steps = gr.Number(label="Inference steps", value=15, interactive=True)
+                    
+                    inference_btn1 = gr.Button(value="Edit")
+                    
+                with gr.TabItem("Advanced Setting"):
+                    with gr.Accordion(label="MM-DiT layers control strategy", open=False):
+                        registered_attn_processors = gr.Dropdown(label="AttnProcessor layers", value=list(range(0, 24)), choices=list(range(0,24)), multiselect=True, interactive=True)
+                        attn_store_layers = gr.Dropdown(label="AttnStore layers", value=list(range(0, 24)), choices=list(range(0,24)), multiselect=True, interactive=True)
+                        cross_replace_layers = gr.Dropdown(label="Cross-Attn replace layers", value=list(range(8, 24)), choices=list(range(0,24)), multiselect=True, interactive=True)
+                        self_process_layers = gr.Dropdown(label="Self-Attn process layers", value=list(range(0, 24)), choices=list(range(0,24)), multiselect=True, interactive=True)
+                    
+                    with gr.Group():
+                        with gr.Column():
+                            with gr.Row():
+                                store_start_step = gr.Number(label="Store start", value=0.0, minimum=0.0, maximum=1.0, step=0.05, interactive=True)
+                                store_end_step = gr.Number(label="Store end", value=1.0, minimum=0.0, maximum=1.0, step=0.05, interactive=True)
+                                
+                            with gr.Row():
+                                cross_start_step = gr.Number(label="Cross start", value=0.0, minimum=0.0, maximum=1.0, step=0.05, interactive=True)
+                                cross_end_step = gr.Number(label="Cross end", value=0.5, minimum=0.0, maximum=1.0, step=0.05, interactive=True)
+                                
+                            with gr.Row():
+                                self_start_step = gr.Number(label="Self start", value=0.0, minimum=0.0, maximum=1.0, step=0.05, interactive=True)
+                                self_end_step = gr.Number(label="Self end", value=0.0, minimum=0.0, maximum=1.0, step=0.05, interactive=True)
+                            
+                            with gr.Row():
+                                blend_start_step = gr.Number(label="Blend start", value=0.6, minimum=0.0, maximum=1.0, step=0.05, interactive=True)
+                                blend_end_step = gr.Number(label="Blend end", value=1.0, minimum=0.0, maximum=1.0, step=0.05, interactive=True)
+                    inference_btn2 = gr.Button(value="Edit")
+                    
+            inference_btn1.click(
+                edit, 
+                inputs = [source_image, source_prompt, source_guidance_scale, source_blend_words, source_blend_thresh, target_prompt, target_guidance_scale,
+                    target_blend_words, target_blend_thresh, registered_attn_processors, attn_store_layers, cross_replace_layers, self_process_layers,
+                    store_start_step, store_end_step, cross_start_step, cross_end_step, self_start_step, self_end_step, blend_start_step, blend_end_step,
+                    seed, num_inference_steps],  
+                outputs = [result_image]
+            )
+            inference_btn2.click(
+                edit, 
+                inputs = [source_image, source_prompt, source_guidance_scale, source_blend_words, source_blend_thresh, target_prompt, target_guidance_scale,
+                    target_blend_words, target_blend_thresh, registered_attn_processors, attn_store_layers, cross_replace_layers, self_process_layers,
+                    store_start_step, store_end_step, cross_start_step, cross_end_step, self_start_step, self_end_step, blend_start_step, blend_end_step,
+                    seed, num_inference_steps],  
+                outputs = [result_image]
+            )
+            
+        examples = gr.Examples(
+            examples=[
+                ["images/cat.jpg", "a opened eyes cat sitting on wooden floor", 1.0, "", 0.4, "a closed eyes cat sitting on wooden floor", 3,
+                "eyes", 0.2, list(range(0, 24)), list(range(0,24)), list(range(8, 24)), list(range(0, 24)), 
+                0.0, 1.0, 0.0, 0.5, 0.0, 0.0, 0.0, 1.0, 1823, 15],
+                ["images/rose.jpg", "a red rose in the dark", 1.5, "", 0.4, "a blue rose in the dark", 3.5,
+                "rose", 0.07, list(range(0, 24)), list(range(0,24)), list(range(8, 24)), list(range(0, 24)), 
+                0.0, 1.0, 0.0, 0.8, 0.0, 0.0, 0.6, 1.0, 1823, 15],
+                ["images/lion.jpg", "a lion looking to the left is standing on the grass", 1.5, "", 0.4, "a lion looking ahead is standing on the grass", 3.5, 
+                "lion", 0.07, list(range(0, 24)), list(range(0,24)), list(range(8, 24)), list(range(0, 24)),
+                0.0, 1.0, 0.0, 0.3, 0.0, 0.0, 0.6, 1.0, 0, 15],
+                ["images/flower.jpg", "white flowers on a tree branch with blue sky background", 1.5, "", 0.4, "an oil painting of white flowers on a tree branch with blue sky background", 3.5, 
+                "", 0.2, list(range(0, 24)), list(range(0,24)), list(range(8, 24)), list(range(0, 24)),
+                0.0, 1.0, 0.0, 0.7, 0.0, 0.0, 0.7, 1.0, 1823, 15],
+            ],
+            inputs = [source_image, source_prompt, source_guidance_scale, source_blend_words, source_blend_thresh, target_prompt, target_guidance_scale,
+                    target_blend_words, target_blend_thresh, registered_attn_processors, attn_store_layers, cross_replace_layers, self_process_layers,
+                    store_start_step, store_end_step, cross_start_step, cross_end_step, self_start_step, self_end_step, blend_start_step, blend_end_step,
+                    seed, num_inference_steps]
         )
+            
 
-        logger.info(f"[{i+1}/{annotation_count}] using time `{duration}s`.")
-        
-        output_filename = os.path.join(result_root, "annotation_images", annotation["image_path"])
-        output_dir = os.path.dirname(output_filename)
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir, exist_ok=True)
-        result.save(output_filename)
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-    
-    
-
-
-
+    flowedit_demo.launch()

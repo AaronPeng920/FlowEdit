@@ -164,8 +164,6 @@ def get_mapper(x: str, y: str, specifier, tokenizer, encoder, device, max_len=77
                         max_s = i_source
                         max_t = i_target
             if max_s is not None:
-                mapper[max_t] = max_s
-                alphas[max_t] = 1
                 for t in e_seq:
                   if x_seq[max_s] == t:
                     alpha_e[max_t] = 1

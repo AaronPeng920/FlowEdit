@@ -1,3 +1,4 @@
+import warnings
 import torch
 from pipeline_flowedit import FlowEditPipeline
 from attention_processor import register_attention_processor, visualize_attention
@@ -8,32 +9,156 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from sklearn.decomposition import PCA
 from PIL import Image
 import numpy as np
+import torch.nn.functional as nnf
+import time
+from utils import combine_images_with_captions
+
+# Copied and revised from https://github.com/sled-group/InfEdit/blob/main/app_infedit/LocalBlend
+class LocalBlend:
+    def __init__(
+        self, 
+        source_thresh: Optional[float] = 0.0,
+        target_thresh: Optional[float] = 0.0,
+        save_blend_mask: Optional[bool] = False,
+        num_steps: Optional[int] = 10,
+        start_step: Optional[float] = 0.0,
+        end_step: Optional[float] = 0.0
+    ):
+        self.source_thresh = source_thresh
+        self.target_thresh = target_thresh
+        self.save_blend_mask = save_blend_mask
+        self.start_step = start_step
+        self.end_step = end_step
+        self.num_steps = num_steps
+        self.cur_step = 0
+    
+    def reset(self):
+        self.cur_step = 0
+        
+    def set_blend(
+        self,
+        alphas: torch.Tensor,
+        target_blend_alphas: torch.Tensor,
+        source_blend_alphas: torch.Tensor,
+    ):
+        self.alphas = alphas
+        self.target_blend_alphas = target_blend_alphas
+        self.source_blend_alphas = source_blend_alphas
+        target_source_blend_alphas = target_blend_alphas.to(torch.bool) & source_blend_alphas.to(torch.bool)
+        self.target_source_blend_alphas = target_source_blend_alphas.to(torch.float)
+        
+    def __get_mask(
+        self, 
+        attn_map: torch.Tensor,
+        word_idxs: torch.Tensor,
+        thresh: Optional[float] = 0.0
+    ):
+        """Extracting attention maps with word_idx and apply thresh to get mask. 
+        
+        Args:
+            attn_map: torch.Tensor of shape `[b, n_layers, L, S]`
+            word_idxs: torch.Tensor of shape `[b, L]`
+            thresh: float
+            
+        Return:
+            mask: torch.Tensor of shape `[b, 1, 2s, 2s]`, s is equal to S.sqrt()
+        """
+        bs, n_layers, L, S = attn_map.shape
+        s = int(S ** 0.5)
+        
+        if word_idxs.sum() == 0:
+            maps = torch.zeros(bs, 1, 2*s, 2*s).to(attn_map.device, attn_map.dtype)     # zeroTensor, [b, 1, 2s, 2s]
+            mask = maps > 0                                                             # boolTensor (False), [b, 1, 2s, 2s]
+        else:
+            word_idxs = word_idxs.squeeze(dim=0)                            # [L]
+            word_idxs = word_idxs > 0                                       # boolTensor, [L]
+            extract_maps = attn_map[:, :, word_idxs, :]                     # [b, n_layers, M, S], M is the number of True in word_idxs
+            extract_maps = torch.mean(extract_maps, dim=1)                  # [b, M, S]
+            extract_maps = torch.mean(extract_maps, dim=1)                  # [b, S]
+            maps = extract_maps.reshape(extract_maps.shape[0], 1, s, s)     # [b, 1, s, s]
+            maps = nnf.interpolate(maps, size=(2*s, 2*s))                   # [b, 1, 2s, 2s]
+            maps = (maps - maps.min()) / (maps.max() - maps.min())          # normalization, [b, 1, 2s, 2s]
+            mask = maps > thresh                                            # boolTensor, [b, 1, 2s, 2s]
+        return mask, maps
+
+
+    def __save_blend_mask(self, blend_mask: torch.Tensor, save_name: str):
+        blend_mask = blend_mask.squeeze().cpu().numpy()
+        blend_mask_gray = (blend_mask * 255).astype(np.uint8)                               # 0 for black, 255 for white
+        blend_mask = Image.fromarray(blend_mask_gray, mode='L')  
+        blend_mask.save(save_name)
+        
+    def __call__(
+        self,
+        step: int,
+        target_latent: torch.Tensor,
+        source_latent: torch.Tensor,
+        attn_store: List[torch.Tensor],
+        sigma
+    ):
+        """Local Blend
+        
+        Args:
+            target_latent: torch.Tensor of shape `[2b, C, s, s]`
+            source_latent: torch.Tensor of shape `[2b, C, s, s]`
+            attn_store: List[torch.Tensor] of shape `n_layer * [2b, L, S]`, n_layer is processed layers count
+        """
+        cur_progress = (self.cur_step + 1) * 1.0 / self.num_steps
+        if cur_progress >= self.start_step and cur_progress <= self.end_step:
+            attn_maps = torch.stack(attn_store, dim=1)                          # [2b, n_layers, L, S]
+            target_attn_maps, source_attn_maps = attn_maps.chunk(2, dim=0)      # 2 * [b, n_layers, L, S]
+            
+            source_blend_mask, source_blend_maps = self.__get_mask(
+                source_attn_maps, 
+                self.source_blend_alphas, 
+                self.source_thresh
+            )       # [b, 1, s, s]
+            target_blend_mask, target_blend_maps = self.__get_mask(
+                target_attn_maps, 
+                self.target_blend_alphas, 
+                self.target_thresh
+            )      # [b, 1, s, s]
+
+            if self.save_blend_mask:
+                self.__save_blend_mask(source_blend_mask[0], f"inters/blend_masks/source_blend_mask_step_{step}.png")
+                self.__save_blend_mask(target_blend_mask[0], f"inters/blend_masks/target_blend_mask_step_{step}.png")
+            if self.target_blend_alphas.sum() != 0:
+                blended_latent = torch.where(target_blend_mask, target_latent, source_latent)
+            else:
+                blended_latent = target_latent
+            blended_latent = torch.where(source_blend_mask, source_latent, blended_latent)
+            target_latent = blended_latent
+        self.cur_step += 1
+        return target_latent
 
 # Copied and revised from https://github.com/sled-group/InfEdit/blob/main/app_infedit/AttentionControl
 class AttentionControl(abc.ABC):
     def step_callback(self, z_t):
         return z_t
 
-    def between_steps(self):
+    def between_steps(self, layer_id: int):
         return
 
     @abc.abstractmethod
-    def forward(self, attn_weight: torch.Tensor, value: torch.Tensor):
+    def forward(self, layer_id: int, attn_weight: torch.Tensor, value: torch.Tensor):
+        raise NotImplementedError
+    
+    @abc.abstractmethod
+    def process_qkv(self, layer_id: int, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):
         raise NotImplementedError
 
-    def __call__(self, attn_weight: torch.Tensor, value: torch.Tensor):
+    def __call__(self, layer_id: int, attn_weight: torch.Tensor, value: torch.Tensor):
         if self.do_classifier_free_guidance:
             bs = attn_weight.shape[0]
-            # attn_weight[:bs // 2], value[:bs // 2] = self.forward(attn_weight[:bs // 2], value[:bs // 2])
-            attn_weight[bs // 2:], value[bs // 2:] = self.forward(attn_weight[bs // 2:], value[bs // 2:])
+            attn_weight[bs // 2:], value[bs // 2:] = self.forward(layer_id, attn_weight[bs // 2:], value[bs // 2:])
         else:
-            attn_weight, value = self.forward(attn_weight, value)
+            attn_weight, value = self.forward(layer_id, attn_weight, value)
         self.cur_att_layer += 1
         if self.cur_att_layer == self.num_att_layers:
-            logger.info(f"Complete the {self.cur_step + 1}/{self.num_inference_steps} step.")
+            self.between_steps(layer_id)
             self.cur_att_layer = 0
             self.cur_step += 1
-            self.between_steps()
+            
         return attn_weight, value
 
     def reset(self):
@@ -42,12 +167,13 @@ class AttentionControl(abc.ABC):
 
     def __init__(
         self, 
-        num_inference_steps: int = 25, 
-        do_classifier_free_guidance: bool = True, 
-        device: str = "cpu"
+        num_inference_steps: int, 
+        do_classifier_free_guidance: bool, 
+        device: str
     ):
         self.cur_step = 0
         self.num_att_layers = -1
+        self.registered_layer_ids = []
         self.cur_att_layer = 0
         self.num_inference_steps = num_inference_steps
         self.do_classifier_free_guidance = do_classifier_free_guidance
@@ -55,91 +181,143 @@ class AttentionControl(abc.ABC):
 
 # Copied and revised from https://github.com/sled-group/InfEdit/blob/main/app_infedit/EmptyControl
 class EmptyControl(AttentionControl):
-    def forward(self, attn_weight: torch.Tensor, value: torch.Tensor):
+    def forward(self, layer_id: int, attn_weight: torch.Tensor, value: torch.Tensor):
         return attn_weight, value
+    
+    def process_qkv(self, layer_id: int, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):
+        return query, key, value
 
 # Copied and revised from https://github.com/sled-group/InfEdit/blob/main/app_infedit/AttentionStore
 class AttentionStore(AttentionControl):
+    def __init__(
+        self, 
+        store_enable_layers: list,
+        store_start_step: float,
+        store_end_step: float,
+        num_inference_steps: int, 
+        image_resolution: int,
+        has_text_encoder_3: bool,
+        visualize_now: bool,
+        do_classifier_free_guidance: bool,
+        device: str,
+        store_mode: Optional[str] = None,
+        **kwargs
+    ):
+        assert store_mode in [
+            None, "all", "select",
+            "latent2latent", "latent2clip", "latent2t5",
+            "clip2latent", "clip2clip", "clip2t5",
+            "t52latent", "t52clip", "t52t5"
+        ]
+        
+        super(AttentionStore, self).__init__(
+            num_inference_steps=num_inference_steps,
+            do_classifier_free_guidance=do_classifier_free_guidance, 
+            device=device
+        )
+        
+        self.store_enable_layers = store_enable_layers
+        self.store_start_step = store_start_step
+        self.store_end_step = store_end_step
+        self.store_mode = store_mode
+        self.num_inference_steps = num_inference_steps
+        self.step_store = self.get_empty_store()
+        self.attention_store = []
+        self.image_resolution = image_resolution
+        self.has_text_encoder_3 = has_text_encoder_3
+        self.visualize_now = visualize_now
+        self.index = kwargs.get("index", None) 
+        if store_mode == 'select' and self.index is None:
+            raise ValueError(f"You choose attention apart mode of `{store_mode}`, so you should provide the argument of `index`.")
+        
     @staticmethod
     def get_empty_store():
         return []
 
-    def forward(self, attn_weight: torch.Tensor, value: torch.Tensor):
-        if self.mode is not None and self.mode != "":
-            stored_attn_weight = self.__get_attention_apart(attn_weight)
+    def process_qkv(self, layer_id: int, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):
+        return query, key, value
+    
+    def forward(self, layer_id: int, attn_weight: torch.Tensor, value: torch.Tensor):
+        """Saving or visualizing attention maps of the average attention heads.
+        
+        Args:
+            attn_weight: torch.Tensor of shape `[2b, num_heads, S+L, S+L]`, `S` is the image token length, `L` is the text token length
+        """
+        if self.store_mode is not None:
+            stored_attn_weight = self.__get_attention_apart(attn_weight)        # `[2b, L1, L2]`
             if self.visualize_now:
                 self.__visualize_attention_now(stored_attn_weight)
             else:
-                self.step_store.append(stored_attn_weight)
+                cur_progress = (self.cur_step + 1) * 1.0 / self.num_inference_steps
+                if layer_id in self.store_enable_layers and cur_progress >= self.store_start_step and cur_progress <= self.store_end_step:
+                    self.step_store.append(stored_attn_weight)    
         return attn_weight, value
             
-    def between_steps(self):
+    def between_steps(self, layer_id: int):
         if len(self.attention_store) == 0:
             self.attention_store = self.step_store
         else:
-            for i in range(len(self.attention_store)):
-                self.attention_store[i] += self.step_store[i]
-        self.step_store = self.get_empty_store()
-
-    def get_average_attention(self):
-        average_attention = [attn_store / self.cur_step for attn_store in self.attention_store]
-        return average_attention
+            cur_progress = (self.cur_step + 1) * 1.0 / self.num_inference_steps
+            if cur_progress >= self.store_start_step and cur_progress <= self.store_end_step:
+                for i in range(len(self.attention_store)):
+                    self.attention_store[i] += self.step_store[i]
+        next_progress = (self.cur_step + 1 + 1) * 1.0 / self.num_inference_steps
+        if not (next_progress > self.store_end_step and next_progress <= 1.0):
+            self.step_store = self.get_empty_store()
 
     def reset(self):
         super(AttentionStore, self).reset()
         self.step_store = self.get_empty_store()
         self.attention_store = []
-
+        
     def __get_attention_apart(self, attn_weight: torch.Tensor):
         clip_l = 77
         t5_l = 256 if self.has_text_encoder_3 else 77
         latent_l = (self.image_resolution // 8 // 2) ** 2                               # `// 8` for vae encode, `// 2` for patchify
         
-        attn_weight = torch.mean(attn_weight, dim=1)                                    # [B, num_heads, L, L] -> [B, L, L]
+        attn_weight = torch.mean(attn_weight, dim=1)                                    # [b, num_heads, S+L, S+L] -> [b, S+L, S+L]
         
         latent2latent = attn_weight[:, :latent_l, :latent_l]
         latent2clip = attn_weight[:, :latent_l, latent_l:latent_l+clip_l]
-        latent2t5 = attn_weight[:, :latent_l, latent_l+clip_l:]
+        latent2t5 = attn_weight[:, :latent_l, latent_l+clip_l:latent_l+clip_l+t5_l]
         
         clip2latent = attn_weight[:, latent_l:latent_l+clip_l, :latent_l]
         clip2clip = attn_weight[:, latent_l:latent_l+clip_l, latent_l:latent_l+clip_l]
-        clip2t5 = attn_weight[:, latent_l:latent_l+clip_l, latent_l+clip_l:]
+        clip2t5 = attn_weight[:, latent_l:latent_l+clip_l, latent_l+clip_l:latent_l+clip_l+t5_l]
         
-        t52latent = attn_weight[:, latent_l+clip_l:, :latent_l]
-        t52clip = attn_weight[:, latent_l+clip_l:, latent_l:latent_l+clip_l]
-        t52t5 = attn_weight[:, latent_l+clip_l:, latent_l+clip_l:]
+        t52latent = attn_weight[:, latent_l+clip_l:latent_l+clip_l+t5_l, :latent_l]
+        t52clip = attn_weight[:, latent_l+clip_l:latent_l+clip_l+t5_l, latent_l:latent_l+clip_l]
+        t52t5 = attn_weight[:, latent_l+clip_l:latent_l+clip_l+t5_l, latent_l+clip_l:latent_l+clip_l+t5_l]
         
-        if self.mode == 'all':
+        if self.store_mode == 'all':
             return attn_weight
-        elif self.mode == 'latent2latent':
+        elif self.store_mode == 'latent2latent':
             return latent2latent
-        elif self.mode == 'latent2clip':
+        elif self.store_mode == 'latent2clip':
             return latent2clip
-        elif self.mode == 'latent2t5':
+        elif self.store_mode == 'latent2t5':
             return latent2t5
-        elif self.mode == 'clip2latent':
+        elif self.store_mode == 'clip2latent':
             return clip2latent
-        elif self.mode == 'clip2clip':
+        elif self.store_mode == 'clip2clip':
             return clip2clip
-        elif self.mode == 'clip2t5':
+        elif self.store_mode == 'clip2t5':
             return clip2t5
-        elif self.mode == 't52latent':
+        elif self.store_mode == 't52latent':
             return t52latent
-        elif self.mode == 't52clip':
+        elif self.store_mode == 't52clip':
             return t52clip
-        elif self.mode == 't52t5':
+        elif self.store_mode == 't52t5':
             return t52t5
-        elif self.mode == 'select':                                      # for latent2clip
+        elif self.store_mode == 'select':                               
             select_index = self.index
             attn_map = latent2clip[:, :, select_index]
             H = W = int(attn_map.shape[-1] ** 0.5)
-            attn_map = attn_map.view(-1, H, W)
+            attn_map = attn_map.view(-1, H, W)                         
             return attn_map
-        else:
-            raise ValueError(f"Unsupport attention apart mode of `{self.mode}`.")
     
     def __visualize_attention_now(self, attn_weight: torch.Tensor):
-        """Visualize attention map of shape `[B, L, S]` or `[B, H, W]` if select mode right now."""
+        """Visualize attention map of shape `[2b, L1, L2]` """
         height = attn_weight.shape[1]
         width = attn_weight.shape[0] * attn_weight.shape[2]
         attn_map_images = Image.new("L", (width, height))
@@ -152,92 +330,74 @@ class AttentionStore(AttentionControl):
             save_prefix = f"flowedit_curlayer{self.cur_att_layer}_"
             attn_map_images.paste(attn_map_img, (offset, 0))
             offset += attn_weight.shape[2]
-        if self.mode == 'select':
-            attn_map_images.save(f"inters/flowedit_attentions/{save_prefix}{self.mode}_{self.index}th_token_curstep_{self.cur_step}.png")
+        if self.store_mode == 'select':
+            attn_map_images.save(f"inters/flowedit_attentions/{save_prefix}{self.store_mode}_{self.index}th_token_curstep_{self.cur_step}.png")
         else:
-            attn_map_images.save(f"inters/flowedit_attentions/{save_prefix}{self.mode}_curstep_{self.cur_step}.png")
-        
-        
-    def __init__(
-        self,
-        num_inference_steps: Optional[int] = 25, 
-        image_resolution: Optional[int] = 512,
-        has_text_encoder_3: Optional[bool] = False,
-        mode: Optional[str] = None,
-        visualize_now: Optional[bool] = False,
-        do_classifier_free_guidance: Optional[bool] = True,
-        device: Optional[str] = "cpu",
-        **kwargs
-    ):
-        assert mode in [
-            None, "all", "select",
-            "latent2latent", "latent2clip", "latent2t5",
-            "clip2latent", "clip2clip", "clip2t5",
-            "t52latent", "t52clip", "t52t5"
-        ]
-        super(AttentionStore, self).__init__(
-            num_inference_steps=num_inference_steps,
-            do_classifier_free_guidance=do_classifier_free_guidance, 
-            device=device
-        )
-        self.num_inference_steps = num_inference_steps
-        self.step_store = self.get_empty_store()
-        self.attention_store = []
-        self.image_resolution = image_resolution
-        self.has_text_encoder_3 = has_text_encoder_3
-        self.mode = mode
-        self.visualize_now = visualize_now
-        self.index = kwargs.get("index", None) 
-        if mode == 'select' and self.index is None:
-            raise ValueError(f"You choose attention apart mode of `{mode}`, so you should provide the argument of ")
-        
+            attn_map_images.save(f"inters/flowedit_attentions/{save_prefix}{self.store_mode}_curstep_{self.cur_step}.png")
+            
 # Copied and revised from https://github.com/sled-group/InfEdit/blob/main/app_infedit/AttentionControlEdit
 class AttentionControlEdit(AttentionStore, abc.ABC):
     @abc.abstractmethod
-    def replace_attention(self, attn_source, attn_target):
+    def replace_attention(self, layer_id:int, attn_source: torch.Tensor, attn_target: torch.Tensor, value: torch.Tensor):
         raise NotImplementedError
     
-    def forward(self, attn_weight: torch.Tensor, value: torch.Tensor):
+    def forward(self, layer_id: int, attn_weight: torch.Tensor, value: torch.Tensor):
         """
         Replace target branch attention weight with source branch without considering CFG
         
         Args:
-            attn_weight: torch.Tensor of shape `[2b, h, L, L]`, b is the number of <prompt, source_prompt> pairs
-            value: torch.Tensor of shape `[2b, h, L, C // h]`
+            attn_weight: torch.Tensor of shape `[2b, num_heads, S+L, S+L]`, b is the number of <prompt, source_prompt> pairs
+            value: torch.Tensor of shape `[2b, num_heads, S+L, C]`, `C` is the channels of each head 
         """
-        target_attn_weight, source_attn_weight = attn_weight.chunk(2, dim=0)        # [b, h, L, L]
-        target_attn_replace = self.replace_attention(source_attn_weight, target_attn_weight)
-        attn_store = torch.cat([target_attn_replace, source_attn_weight], dim=0)    # [2b, h, L, L]
-        super(AttentionControlEdit, self).forward(attn_store, value)
+        target_attn_weight, source_attn_weight = attn_weight.chunk(2, dim=0)        # [b, num_heads, S+L, S+L]
+        target_attn_replace = self.replace_attention(
+            layer_id, 
+            source_attn_weight, 
+            target_attn_weight, 
+            value
+        )                                                                          
+
+        attn_store = torch.cat([target_attn_replace, source_attn_weight], dim=0)    # [2b, num_heads, S+L, S+L]
+        super(AttentionControlEdit, self).forward(layer_id, attn_store, value)
         attn_weight = torch.cat([target_attn_replace, source_attn_weight], dim=0)
         return attn_weight, value
 
     def __init__(
         self, 
         num_inference_steps: Optional[int] = 25,
+        cross_replace_enable_layers: Optional[list] = list(range(24)),
+        self_process_enable_layers: Optional[list] = list(range(24)),
         cross_start_step: Optional[float] = 0.,
         cross_end_step: Optional[float] = 0.,
         self_start_step: Optional[float] = 0.,
         self_end_step: Optional[float] = 0.,
+        store_enable_layers: Optional[list] = list(range(24)),
+        store_start_step: Optional[float] = 0.0,
+        store_end_step: Optional[float] = 1.0,
         image_resolution: Optional[int] = 512,
         has_text_encoder_3: Optional[bool] = False,
-        mode: Optional[str] = None,
-        do_classifier_free_guidance: Optional[bool] = True,
+        store_mode: Optional[str] = None,
         visualize_attention_now: Optional[bool] = False,
+        do_classifier_free_guidance: Optional[bool] = True,
         device: Optional[str] = "cpu",
         **kwargs
     ):
         super(AttentionControlEdit, self).__init__(
-            num_inference_steps=num_inference_steps,
+            store_enable_layers=store_enable_layers,
+            store_start_step=store_start_step,
+            store_end_step=store_end_step,
+            num_inference_steps=num_inference_steps, 
             image_resolution=image_resolution,
             has_text_encoder_3=has_text_encoder_3,
-            mode=mode,
-            do_classifier_free_guidance=do_classifier_free_guidance,
+            store_mode=store_mode,
             visualize_now=visualize_attention_now,
+            do_classifier_free_guidance=do_classifier_free_guidance,
             device=device,
             **kwargs
         )
-        self.num_inference_steps = num_inference_steps
+        
+        self.cross_replace_enable_layers = cross_replace_enable_layers
+        self.self_process_enable_layers = self_process_enable_layers
         self.cross_start_step = cross_start_step
         self.cross_end_step = cross_end_step
         self.self_start_step = self_start_step
@@ -245,7 +405,19 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
 
 # Copied and revised from https://github.com/sled-group/InfEdit/blob/main/app_infedit/AttentionRefine
 class AttentionRefine(AttentionControlEdit):
-    def replace_attention(self, attn_source, attn_target):
+    def callback_on_step_end(self, pipe, step_i, timestep, local_kwargs):
+        if self.local_blend is None:
+            return local_kwargs
+        else:
+            latents = local_kwargs.get("latents", None)
+            source_latents = local_kwargs.get("source_latents", None)
+            scheduler = pipe.scheduler
+            sigma = scheduler.sigmas[scheduler.step_index - 1]
+            blended_latent = self.local_blend(step_i, latents, source_latents, self.attention_store, sigma)
+            output_kwargs = {"latents": blended_latent}
+            return output_kwargs
+        
+    def replace_attention(self, layer_id: int, attn_source: torch.Tensor, attn_target: torch.Tensor, value: torch.Tensor):
         """
         Replace attn_target weight with attn_source weight with mapper got from Needleman-Wunsch global sequence alignment algorithm
 
@@ -262,69 +434,51 @@ class AttentionRefine(AttentionControlEdit):
         latent_l = (self.image_resolution // 8 // 2) ** 2
         b = attn_source.shape[0]
 
-        mapper_l = self.mapper.shape[-1]
-        source_latent2text = attn_source[:, :, :latent_l, latent_l:latent_l+mapper_l] 
-        target_latent2text = attn_target[:, :, :latent_l, latent_l:latent_l+mapper_l] 
-        source_text2latent = attn_source[:, :, latent_l:latent_l+mapper_l, :latent_l]
-        target_text2latent = attn_target[:, :, latent_l:latent_l+mapper_l, :latent_l]
-
-        attn_replace = attn_target.clone()
-        mapped_source_latent2text = source_latent2text[:, :, :, self.mapper].squeeze()
-        mapped_source_text2latent = source_text2latent[:, :, self.mapper, :].squeeze()
-        alphas = self.alphas.transpose(-1, -2)
-        attn_replace[:, :, :latent_l, latent_l:latent_l+mapper_l] = mapped_source_latent2text * self.alphas + (1. - self.alphas) * target_latent2text
-        attn_replace[:, :, latent_l:latent_l+mapper_l, :latent_l] = mapped_source_text2latent * alphas + (1. - alphas) * target_text2latent
         cur_progress = (self.cur_step + 1) * 1.0 / self.num_inference_steps
-        if cur_progress >= self.cross_start_step and cur_progress <= self.cross_end_step:
-            logger.info(f"Replace cross attention map at {self.cur_att_layer}th layer.")
-            attn_target[:b] = attn_replace
+        if layer_id in self.cross_replace_enable_layers:
+            if cur_progress >= self.cross_start_step and cur_progress <= self.cross_end_step:
+                mapper_l = clip_l + t5_l
+                source_latent2text = attn_source[:, :, :latent_l, latent_l:latent_l+mapper_l] 
+                target_latent2text = attn_target[:, :, :latent_l, latent_l:latent_l+mapper_l] 
+                source_text2latent = attn_source[:, :, latent_l:latent_l+mapper_l, :latent_l]
+                target_text2latent = attn_target[:, :, latent_l:latent_l+mapper_l, :latent_l]
+
+                attn_replace = attn_target.clone()
+                mapped_source_latent2text = source_latent2text[:, :, :, self.mapper].squeeze()
+                mapped_source_text2latent = source_text2latent[:, :, self.mapper, :].squeeze()
+                
+                alphas = self.alphas.transpose(-1, -2)
+                attn_replace[:, :, :latent_l, latent_l:latent_l+mapper_l] = mapped_source_latent2text * self.alphas + (1. - self.alphas) * target_latent2text
+                attn_replace[:, :, latent_l:latent_l+mapper_l, :latent_l] = mapped_source_text2latent * alphas + (1. - alphas) * target_text2latent
+
+                attn_target = attn_replace
         
         return attn_target
 
-    def process_qkv(
-        self,
-        query,
-        key,
-        value
-    ):
+    def process_qkv(self, layer_id: int, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):   
+        clip_l = 77
+        t5_l = 256 if self.has_text_encoder_3 else 77
+        latent_l = (self.image_resolution // 8 // 2) ** 2
+
         cur_progress = (self.cur_step + 1) * 1.0 / self.num_inference_steps
-        if cur_progress >= self.self_start_step and cur_progress <= self.self_end_step:
-            clip_l = 77
-            t5_l = 256 if self.has_text_encoder_3 else 77
-            latent_l = (self.image_resolution // 8 // 2) ** 2
-            mapper_l = self.mapper.shape[-1]
-            
-            if self.do_classifier_free_guidance:
-                target_key_uncond, source_key_uncond, target_key_cond, source_key_cond = key.chunk(4, dim=0)
-                target_query_uncond, source_query_uncond, target_query_cond, source_query_cond = query.chunk(4, dim=0)
-                target_value_uncond, source_value_uncond, target_value_cond, source_value_cond = value.chunk(4, dim=0)
+        if layer_id in self.self_process_enable_layers:
+            if cur_progress >= self.self_start_step and cur_progress <= self.self_end_step:
+                target_uncond_value, source_uncond_value, target_cond_value, source_cond_value = value.chunk(4, dim=0)
+                target_uncond_value_text = target_uncond_value[:, :, latent_l:, :]
+                source_uncond_value_text = source_uncond_value[:, :, latent_l:, :]
+                target_cond_value_text = target_cond_value[:, :, latent_l:, :]
+                source_cond_value_text = source_cond_value[:, :, latent_l:, :]
                 
-                target_key_uncond[:, :, latent_l:latent_l+mapper_l, :] = source_key_uncond[:, :, latent_l:latent_l+mapper_l, :]
-                # target_key_cond[:, :, latent_l:latent_l+mapper_l, :] = source_key_cond[:, :, latent_l:latent_l+mapper_l, :]
-                target_value_uncond[:, :, latent_l:latent_l+mapper_l, :] = source_value_uncond[:, :, latent_l:latent_l+mapper_l, :]
-                # target_value_cond[:, :, latent_l:latent_l+mapper_l, :] = source_value_cond[:, :, latent_l:latent_l+mapper_l, :]
+                value_uncond_text_replace = source_uncond_value_text[:, :, self.mapper, :].squeeze()
+                value_cond_text_replace = source_cond_value_text[:, :, self.mapper, :].squeeze()
+
+                alphas = self.alphas.transpose(-1, -2)
+                target_uncond_value_text = value_uncond_text_replace * alphas + (1. - alphas) * target_uncond_value_text
+                target_cond_value_text = value_cond_text_replace * alphas + (1. - alphas) * target_cond_value_text
                 
-                key = torch.cat([source_key_uncond, source_key_uncond, source_key_uncond, source_key_uncond], dim=0)
-                value = torch.cat([source_value_uncond, source_value_uncond, source_value_cond, source_value_cond], dim=0)
-            
-                logger.info(f"Modulate Q, K, V at {self.cur_att_layer}th layer.")
-            
-        
-        # pca = PCA(n_components=1)
-        # query_average_heads = torch.mean(value, dim=1).cpu().numpy()
-        # for i, q in enumerate(query_average_heads):
-        #     pca.fit(q)
-        #     embs = pca.transform(q).squeeze()
-        #     embs_latent = embs[:latent_l]
-        #     h = w = int(latent_l ** 0.5)
-        #     embs_latent = embs_latent.reshape(h, w)
-        #     embs_map = (embs_latent - embs_latent.min()) / (embs_latent.max() - embs_latent.min())      
-        #     embs_map = (embs_map >= 0.5).astype(np.uint8)
-        #     embs_map_gray = (embs_map * 255).astype(np.uint8)                               
-        #     embs_map_img = Image.fromarray(embs_map_gray, mode='L')  
-        #     embs_map_img.save(f"inters/queries/layer{self.cur_att_layer}_step_{self.cur_step}_batch_{i}.png")
-        
-    
+                target_uncond_value[:, :, latent_l:, :] = target_uncond_value_text
+                target_cond_value[:, :, latent_l:, :] = target_cond_value_text
+                value = torch.cat([target_uncond_value, source_uncond_value, target_cond_value, source_cond_value], dim=0)
             
         return query, key, value
     
@@ -334,15 +488,22 @@ class AttentionRefine(AttentionControlEdit):
         prompt_specifiers: List[List[str]], 
         tokenizer,
         text_encoder,
-        num_inference_steps: int,
+        num_inference_steps: Optional[int] = 25,
+        use_local_blend: Optional[bool] = True,
+        local_blend: Optional[LocalBlend] = None,
+        cross_replace_enable_layers: Optional[list] = list(range(24)),
+        self_process_enable_layers: Optional[list] = list(range(24)),
         cross_start_step: Optional[float] = 0.,
         cross_end_step: Optional[float] = 0.,
         self_start_step: Optional[float] = 0.,
         self_end_step: Optional[float] = 0.,
+        store_enable_layers: Optional[list] = list(range(24)),
+        store_start_step: Optional[float] = 0.0,
+        store_end_step: Optional[float] = 1.0,
         image_resolution: Optional[int] = 512,
         has_text_encoder_3: Optional[bool] = False,
-        mode: Optional[str] = None,
-        visualize_attention_now: Optional[bool] = False, 
+        store_mode: Optional[str] = None,
+        visualize_attention_now: Optional[bool] = False,
         do_classifier_free_guidance: Optional[bool] = True,
         device: Optional[str] = "cpu",
         torch_dtype: Union[torch.dtype] = torch.float16,
@@ -358,22 +519,28 @@ class AttentionRefine(AttentionControlEdit):
             prompt_specifiers: List[List[str]], target blended words (emphasize editing content) and source blended words (emphasize preserving content) 
                         for each editing scene, the length should be `n`. E.g. [["cat", ""], ["blue", "dog"]]
             num_inference_steps: int
-            start_step: float in [0, 1], the normalized value representing the denoising progress, 
-                        after that attention replacement begins.
-            end_step: float in [0, 1], the normalized value representing the denoising progress, 
-                        after that attention replacement ends.
+            start_step: float in [0, 1], the normalized value representing the denoising progress
+            end_step: float in [0, 1], the normalized value representing the denoising progress
         """
+        assert not (use_local_blend and local_blend is None)
+        
         super(AttentionRefine, self).__init__(
             num_inference_steps=num_inference_steps,
+            cross_replace_enable_layers=cross_replace_enable_layers,
+            self_process_enable_layers=self_process_enable_layers,
             cross_start_step=cross_start_step,
             cross_end_step=cross_end_step,
             self_start_step=self_start_step,
             self_end_step=self_end_step,
+            store_enable_layers=store_enable_layers,
+            store_start_step=store_start_step,
+            store_end_step=store_end_step,
             image_resolution=image_resolution,
             has_text_encoder_3=has_text_encoder_3,
-            mode=mode,
+            store_mode=store_mode,
             visualize_attention_now=visualize_attention_now,
             do_classifier_free_guidance=do_classifier_free_guidance,
+            device=device,
             **kwargs
         )
 
@@ -382,9 +549,9 @@ class AttentionRefine(AttentionControlEdit):
         (
             mapper,
             alphas,
-            ms,                                     # Original alpha
-            alpha_e,                                # For editing
-            alpha_p,                                # For preserving
+            ms,                                             # Original alpha
+            self.alpha_e,                                   # For editing
+            self.alpha_p,                                   # For preserving
             details
         ) = seq_aligner.get_refinement_mapper(
             prompts, 
@@ -393,92 +560,149 @@ class AttentionRefine(AttentionControlEdit):
             text_encoder, 
             device
         )
-        x_seq_string, y_seq_string, original_mapper = details
+        self.x_seq_string, self.y_seq_string, original_mapper = details
         
-        # Expand clip mapper and alphas to clip+t5 mapper and alphas
         t5_mapper = torch.arange(mapper.shape[-1], mapper.shape[-1] + t5_len, dtype=mapper.dtype, device=mapper.device).reshape(1, -1).repeat(mapper.shape[0], 1)
         t5_alphas = torch.ones(t5_len).reshape(1, -1).repeat(alphas.shape[0], 1)
         original_mapper = torch.cat([original_mapper, t5_mapper], dim=1)
         mapper = torch.cat([mapper, t5_mapper], dim=1)
         alphas = torch.cat([alphas, t5_alphas], dim=1)
         
-        
         self.original_mapper = original_mapper.to(device)
-        self.mapper = mapper.to(device)         # [n, S], S if the max_seq_length of tokenizer
-        self.alphas = alphas.reshape(alphas.shape[0], 1, 1, alphas.shape[1]).to(device).to(torch_dtype)     # [n, 1, 1, S]
+        self.mapper = mapper.to(device)                                                                 
+        self.alphas = alphas.reshape(alphas.shape[0], 1, 1, alphas.shape[1]).to(device).to(torch_dtype)         
         self.ms = ms.reshape(ms.shape[0], 1, 1, ms.shape[1]).to(device).to(torch_dtype)
-
-        logger.info(f"=========== Initializing AttentionRefine controller. ===========")
-        logger.info(f"source prompt is `{prompts[0]}`.")
-        logger.info(f"target prompt is `{prompts[1]}`.")
-        logger.info(f"source blend is `{prompt_specifiers[0][1]}`.")
-        logger.info(f"target blend is `{prompt_specifiers[0][0]}`.")
-        logger.info(f"source encoded sequence is `{x_seq_string}`.")
-        logger.info(f"target encoded sequence is `{y_seq_string}`.")
-        logger.info(f"original mapper is {original_mapper}.")
-        logger.info(f"final mapper is `{mapper}`.")
-        logger.info(f"final alphas is `{alphas}`.")
-        logger.info(f"total inference steps is `{num_inference_steps}`.")
-        logger.info(f"cross attention replacement start step is {cross_start_step}.")
-        logger.info(f"cross attention replacement end step is {cross_end_step}.")
-        logger.info(f"self attention replacement start step is {self_start_step}.")
-        logger.info(f"self attention replacement end step is {self_end_step}.")
-        logger.info(f"visualize attention mode is `{mode}`.")
-        logger.info(f"set visualize attention now to `{visualize_attention_now}`.")
-        logger.info(f"extra args are `{kwargs}`.")
-        logger.info(f"================================================================")
-
+        
+        if use_local_blend:
+            self.local_blend = local_blend
+            self.alpha_e = self.alpha_e.to(device).to(torch_dtype)        # [b, 77]
+            self.alpha_p = self.alpha_p.to(device).to(torch_dtype)        # [b, 77]
+            alphas = alphas.to(device).to(torch_dtype)          # [b, 77]
+            self.local_blend.set_blend(alphas, self.alpha_e, self.alpha_p)
+        else:
+            self.local_blend = None
 
 def inference(
     image: Image,
     source_prompt: str,
     target_prompt: str,
-    source_blended_words: Optional[str] = "",
-    target_blended_words: Optional[str] = "",
-    source_guidance_scale: Optional[float] = 7.0,
-    target_guidance_scale: Optional[float] = 7.0,
-    num_inference_steps: Optional[int] = 25,
-    cross_start_step: Optional[float] = 0.,
-    cross_end_step: Optional[float] = 0.,
-    self_start_step: Optional[float] = 0.,
-    self_end_step: Optional[float] = 0.,
+    source_guidance_scale: Optional[float] = 1.5,
+    target_guidance_scale: Optional[float] = 3.5,
+    num_inference_steps: Optional[int] = 15,
     image_resolution: Optional[int] = 512,
     seed: Optional[int] = None,
     attention_processor_filter: Optional[Callable] = None,
-    attention_visualize_mode: Optional[str] = None, 
-    visualize_attention_now: Optional[bool] = False, 
     denoise_model: Optional[bool] = False,
+    
+    store_enable_layers: Optional[list] = list(range(24)),
+    store_start_step: Optional[float] = 0.0,
+    store_end_step: Optional[float] = 1.0,
+    attention_store_mode: Optional[str] = None, 
+    visualize_attention_now: Optional[bool] = False, 
+        
+    use_local_blend: Optional[bool] = False,
+    source_blended_words: Optional[str] = "",
+    target_blended_words: Optional[str] = "",
+    blend_start_step: Optional[float] = 0.0,
+    blend_end_step: Optional[float] = 0.0,
+    source_thresh: Optional[float] = 0.0,
+    target_thresh: Optional[float] = 0.0,
+    save_blend_mask: Optional[bool] = False,
+    
+    cross_replace_enable_layers: Optional[list] = list(range(24)),
+    cross_start_step: Optional[float] = 0.,
+    cross_end_step: Optional[float] = 0.,
+    
+    self_process_enable_layers: Optional[list] = list(range(24)),
+    self_start_step: Optional[float] = 0.,
+    self_end_step: Optional[float] = 0.,
+    
     callback_on_step_end: Optional[Callable] = None,
+    
+    torch_dtype: Optional[torch.dtype] = torch.float16,
+    device: Optional[str] = 'cuda',
     **kwargs
 ):
-    generator = torch.manual_seed(seed) if seed is not None else None
-    logger.info(f"Set random seed `{seed}`.")
-    if callback_on_step_end is not None:
-        logger.info(f"Set step end callback `{callback_on_step_end.__name__}`")
-        
+    image = image.resize([image_resolution, image_resolution])
+    
+    logger.info(f"Source prompt is `{source_prompt}`.")
+    logger.info(f"Target prompt is `{target_prompt}`.")
+    logger.info(f"Source blend words is `{source_blended_words}`.")
+    logger.info(f"Target blend words is `{target_blended_words}`.")
+    logger.info(f"Source guidance scale is `{source_guidance_scale}`.")
+    logger.info(f"Target guidance scale is `{target_guidance_scale}`.")
+    logger.info(f"Using image resolution `{image_resolution}`.")
+    logger.info(f"Num inference steps is `{num_inference_steps}`.")
+    
+    if seed is not None:
+        generator = torch.manual_seed(seed)
+        logger.info(f"Set seed to `{seed}`.")
+    else:
+        generator = None
+    if use_local_blend:
+        local_blend = LocalBlend(
+            source_thresh=source_thresh, 
+            target_thresh=target_thresh, 
+            save_blend_mask=save_blend_mask,
+            num_steps=num_inference_steps,
+            start_step=blend_start_step,
+            end_step=blend_end_step
+        )
+        logger.info(f"Using local blend with source thresh `{source_thresh}`, target thresh `{target_thresh}`, start at `{blend_start_step}`, end at `{blend_end_step}`.")
+    else:
+        local_blend = None
+    
     controller = AttentionRefine(
         prompts=[source_prompt, target_prompt],
         prompt_specifiers=[[target_blended_words, source_blended_words]],
         tokenizer=pipe.tokenizer,
         text_encoder=pipe.text_encoder,
         num_inference_steps=num_inference_steps,
+        
+        use_local_blend=use_local_blend,
+        local_blend=local_blend,
+        
+        
+        cross_replace_enable_layers=cross_replace_enable_layers,
+        self_process_enable_layers=self_process_enable_layers,
         cross_start_step=cross_start_step,
         cross_end_step=cross_end_step,
         self_start_step=self_start_step,
         self_end_step=self_end_step,
+        
+        store_enable_layers=store_enable_layers,
+        store_start_step=store_start_step,
+        store_end_step=store_end_step,
+        
         image_resolution=image_resolution,
         has_text_encoder_3=False,
-        mode=attention_visualize_mode,
+        store_mode=attention_store_mode,
         visualize_attention_now=visualize_attention_now,
         do_classifier_free_guidance=True,
-        device=DEVICE,
-        torch_dtype=TORCH_DTYPE,
+        device=device,
+        torch_dtype=torch_dtype,
         **kwargs
     )
-
+    
     registered_attn_processor_names, registered_attn_processors_count = register_attention_processor(pipe.transformer, controller, attention_processor_filter)
     logger.info(f"Registered {registered_attn_processors_count} {controller.__class__.__name__} controllers, namely {registered_attn_processor_names}.")
+    logger.info(f"Mapper is `{controller.mapper}`.")
+    logger.info(f"Alphas is `{controller.alphas}`.")
+    logger.info(f"Source blend alphas is `{controller.alpha_p}`.")
+    logger.info(f"Target blend alphas is `{controller.alpha_e}`.")
+    logger.info(f"Attn-Store enable layers are `{store_enable_layers}`, start at `{store_start_step}`, end at `{store_end_step}`.")
+    logger.info(f"Cross-Attn replace enable layers are `{cross_replace_enable_layers}`, start at `{cross_start_step}`, end at `{cross_end_step}`.")
+    logger.info(f"Self-Attn process enable layers are `{self_process_enable_layers}`, start at `{self_start_step}`, end at `{self_end_step}`.")
 
+    if use_local_blend:
+        callback_on_step_end = controller.callback_on_step_end
+        if visualize_attention_now is not False or attention_store_mode != "clip2latent":
+            visualize_attention_now = False
+            attention_store_mode = "clip2latent"
+            warnings.warn("You use local blend, so FlowEdit reset your config of `visualize_attention_now` to `False`, \
+                        `attention_store_mode` to `clip2latent` and `callback_on_step_end` to local blend.")
+    
+    start_time = time.time()
     result, source = pipe(
         prompt=target_prompt,
         source_prompt=source_prompt,
@@ -493,14 +717,33 @@ def inference(
         return_source=True,
         callback_on_step_end=callback_on_step_end
     )
-    
+    end_time = time.time()
+    duration = format(end_time - start_time, ".3f")
+    logger.info(f"Done! Using time `{duration}s`")
+        
     result_images = result.images
     source_images = source.images
 
-    return result_images[0], source_images[0], controller
+    return result_images[0], source_images[0], controller, duration
 
 if __name__ == '__main__':
-    from utils import save_inter_latents_callback
+    from utils import save_inter_latents_callback, parse_string_to_processor_id
+    import yaml
+    import json
+    import os
+    import argparse
+    
+    parser = argparse.ArgumentParser(prog='FlowEdit', description='FlowEdit Inference Scripts')
+    parser.add_argument('--image_filename', type=str, default="", help="Source image filename.")
+    parser.add_argument('--source_prompt', type=str, help="Source prompt.")
+    parser.add_argument('--target_prompt', type=str, default="Target prompt.")
+    parser.add_argument('--source_blend_words', type=str, default="", help="Source blend words indicate information to be presevered.")
+    parser.add_argument('--target_blend_words', type=str, default="", help="Target blend words indicate information to be edited.")
+    args = parser.parse_args()
+    
+    
+    
+    # 1. Logging
     logging.basicConfig(
         level=logging.DEBUG, 
         datefmt='%Y/%m/%d %H:%M:%S', 
@@ -510,69 +753,62 @@ if __name__ == '__main__':
     )
     logger = logging.getLogger("FlowEdit")
 
-    MODEL_ID_OR_PATH = "/data/pengzhengwei/checkpoints/stablediffusion/v3"
-    TORCH_DTYPE = torch.float16
-    DEVICE = "cuda:5"
+    # 2. Config
+    config = yaml.load(open("configs/edit.yaml"), Loader=yaml.FullLoader)
+    
+    model_id_or_path = config['pipeline']['model_id_or_path']
+    torch_dtype = torch.float16 if config['pipeline']['dtype'] == 'float16' else torch.float32
+    device = config['pipeline']['device']
 
+    inference_params = {}
+    for sub_name, sub_config in config.items():
+        for k, v in sub_config.items():
+            inference_params[k] = v
+    inference_params["attn_processors"] = parse_string_to_processor_id(inference_params["attn_processors"])
+    def attn_processor_filter(attn_processor_i, attn_processor_name):
+        return True if attn_processor_i in inference_params['attn_processors'] else False
+    inference_params['attention_processor_filter'] = attn_processor_filter
+    inference_params["cross_replace_enable_layers"] = parse_string_to_processor_id(inference_params["cross_replace_enable_layers"])
+    inference_params["self_process_enable_layers"] = parse_string_to_processor_id(inference_params["self_process_enable_layers"])
+    inference_params["store_enable_layers"] = parse_string_to_processor_id(inference_params["store_enable_layers"])
+
+    # 3. Loading pipeline
     pipe = FlowEditPipeline.from_pretrained(
-            MODEL_ID_OR_PATH,
+            model_id_or_path,
             text_encoder_3=None,
             tokenizer_3=None,
-            torch_dtype=TORCH_DTYPE
-        ).to(DEVICE)
-    logger.info(f"Load FlowEditPipeline from `{MODEL_ID_OR_PATH}` successfully, inferencing with `{TORCH_DTYPE}` on `{DEVICE}`.")
+            torch_dtype=torch_dtype
+        ).to(device)
+    logger.info(f"Load FlowEditPipeline from `{model_id_or_path}` successfully, inferencing with `{torch_dtype}` on `{device}`.")
 
-    source_prompt = "a little carton sheep in a white background"
-    target_prompt = "a little carton sheep in a forest background"
-    source_blended_words = ""
-    target_blended_words = ""
-    source_guidance_scale = 1.5
-    target_guidance_scale = 2.0
-    num_inference_steps = 10
-    cross_start_step = 0.0
-    cross_end_step = 0.2
-    self_start_step = 0.2
-    self_end_step = 0.3
-    image_resolution = 512
-    seed = 1234
-    image = Image.open("/data/pengzhengwei/datasets/PIE-Bench/PIE-Bench_v1/annotation_images/8_change_background_80/1_artificial/1_animal/811000000000.jpg").convert('RGB').resize([image_resolution, image_resolution])
-    attention_visualize_mode = None
-    visualize_attention_now = True
-    denoise_model = False
-    callback_on_step_end = save_inter_latents_callback
-    kwargs = {
-        'index': 2
-    }
-
-    def filter(i, name):
-        if i <= 8:
-            return True
-        else:
-            return False
+    # * 4. Preparing params
+    IMAGE_FILENAME = args.image_filename
+    logger.info(f"Processing `{IMAGE_FILENAME}`.")
+    image = Image.open(args.image_filename).convert("RGB")
+    source_prompt = args.source_prompt
+    target_prompt = args.target_prompt
+    source_blended_words = args.source_blend_words
+    target_blended_words = args.target_blend_words
         
-    result_image, source_image, controller = inference(
-        image=image,
-        source_prompt=source_prompt,
-        target_prompt=target_prompt,
+
+    extra_kwargs = {
+        'index': args.index
+    }
+    
+    inference_params.update(extra_kwargs)
+    
+    # 5. Inferencing
+    result_image, source_image, controller, duration = inference(
+        image,
+        source_prompt,
+        target_prompt,
         source_blended_words=source_blended_words,
         target_blended_words=target_blended_words,
-        source_guidance_scale=source_guidance_scale,
-        target_guidance_scale=target_guidance_scale,
-        num_inference_steps=num_inference_steps,
-        cross_start_step=cross_start_step,
-        cross_end_step=cross_end_step,
-        self_start_step=self_start_step,
-        self_end_step=self_end_step,
-        image_resolution=image_resolution,
-        seed=seed,
-        attention_visualize_mode=attention_visualize_mode,
-        visualize_attention_now=visualize_attention_now,
-        denoise_model=denoise_model,
-        attention_processor_filter=filter,
-        callback_on_step_end=callback_on_step_end,
-        **kwargs
+        **inference_params
     )
-
+    image = image.resize([512, 512])
+    result_image = combine_images_with_captions(image, source_prompt, result_image, target_prompt)
     result_image.save("result.png")
-    source_image.save("source.png")
+    
 
+    
